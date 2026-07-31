@@ -17,6 +17,11 @@
 """
 
 import json, os, re, sys, threading, time
+# طباعة فورية — بلا هذا لا تظهر السطور في سجل الاستضافة
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+except Exception:
+    pass
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -122,7 +127,7 @@ def log(kind, data):
         with open(LEDGER, "a") as f: f.write(json.dumps(rec, ensure_ascii=False) + "\n")
     except Exception as e:
         print("ledger error:", e)
-    print(f"[{rec['ts'][11:19]}] {kind}: {json.dumps(data, ensure_ascii=False)[:160]}")
+    print(f"[{rec['ts'][11:19]}] {kind}: {json.dumps(data, ensure_ascii=False)[:160]}", flush=True)
 
 
 class State:
@@ -415,21 +420,40 @@ def handle(msg):
 class H(BaseHTTPRequestHandler):
     def do_POST(self):
         if SECRET and SECRET not in self.path:
+            log("bad_path", {"path": self.path[:60]})
             self.send_response(403); self.end_headers(); return
         n = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(n).decode("utf-8", "ignore")
         self.send_response(200); self.end_headers(); self.wfile.write(b"ok")
+        log("received", {"len": len(body), "head": body[:70]})
         try:
             handle(body)
         except Exception as e:
             log("error", {"exc": str(e), "body": body[:200]})
     def do_GET(self):
-        self.send_response(200); self.end_headers()
-        self.wfile.write(json.dumps({
-            "gate": ST.gate_dir, "pending": ST.pending_dir,
-            "open": list(ST.positions), "day_trades": ST.day_trades,
-            "balance": round(ST.balance, 3), "halted": ST.halted,
-            "paper": PAPER_MODE}, ensure_ascii=False).encode())
+        tail = []
+        try:
+            with open(LEDGER) as f:
+                for l in f.readlines()[-25:]:
+                    r = json.loads(l)
+                    tail.append(f"{r['ts'][11:19]} · {r['kind']} · "
+                                f"{r.get('ticker') or r.get('src') or ''} "
+                                f"{r.get('reason') or ''}".strip())
+        except Exception:
+            tail = ["لا توجد أحداث بعد"]
+        body = {
+            "الحالة": "ورقي" if PAPER_MODE else "تنفيذ حقيقي",
+            "البوابة": {1: "LONG", -1: "SHORT", 0: "مقفولة"}.get(ST.gate_dir),
+            "معلّق": ST.pending_dir, "صفقات مفتوحة": list(ST.positions),
+            "صفقات اليوم": ST.day_trades, "الرصيد": round(ST.balance, 3),
+            "متوقف": ST.halted, "إجمالي الأحداث": len(tail),
+            "آخر الأحداث": tail[::-1],
+        }
+        out = json.dumps(body, ensure_ascii=False, indent=1).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(out)))
+        self.end_headers(); self.wfile.write(out)
     def log_message(self, *a): pass
 
 

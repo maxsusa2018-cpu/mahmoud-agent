@@ -58,10 +58,19 @@ RED_NEWS = [
     # ("2026-08-19 18:00", "FOMC"),
 ]
 
+# مجلد البيانات — يوضع على القرص الدائم كي لا تُمسح عند إعادة النشر
 BASE      = os.path.dirname(os.path.abspath(__file__))
-KILL_FILE = os.path.join(BASE, "KILL")
-LEDGER    = os.path.join(BASE, "ledger.jsonl")   # دفتر الظل — كل شيء
-STATE_F   = os.path.join(BASE, "state.json")
+DATA_DIR  = os.environ.get("DATA_DIR", BASE)
+try:
+    os.makedirs(DATA_DIR, exist_ok=True)
+    _t = os.path.join(DATA_DIR, ".w"); open(_t, "w").close(); os.remove(_t)
+except Exception as e:
+    print(f"⚠️ تعذّر الكتابة في {DATA_DIR} ({e}) — الرجوع لمجلد السكربت", flush=True)
+    DATA_DIR = BASE
+
+KILL_FILE = os.path.join(DATA_DIR, "KILL")
+LEDGER    = os.path.join(DATA_DIR, "ledger.jsonl")   # دفتر الظل — كل شيء
+STATE_F   = os.path.join(DATA_DIR, "state.json")
 
 # ═══════════════════════════════════════════════════════════════
 #  قاموس الإشارات — يطابق نصوص تنبيهاتك الفعلية
@@ -447,6 +456,7 @@ class H(BaseHTTPRequestHandler):
             "معلّق": ST.pending_dir, "صفقات مفتوحة": list(ST.positions),
             "صفقات اليوم": ST.day_trades, "الرصيد": round(ST.balance, 3),
             "متوقف": ST.halted, "إجمالي الأحداث": len(tail),
+            "التخزين": "💾 دائم" if DATA_DIR != BASE else "⚠️ مؤقت",
             "آخر الأحداث": tail[::-1],
         }
         out = json.dumps(body, ensure_ascii=False, indent=1).encode()
@@ -491,6 +501,7 @@ if __name__ == "__main__":
     print("═" * 55)
     print(f"  وكيل محمود 0.1  |  {'📝 ورقي' if PAPER_MODE else '⚠️ تنفيذ حقيقي'}")
     print(f"  المنفذ {PORT}  |  المسار: /{SECRET}")
+    print(f"  البيانات: {DATA_DIR}  {'💾 دائم' if DATA_DIR != BASE else '⚠️ مؤقت — تُمسح عند إعادة النشر'}")
     print(f"  إيقاف فوري: أنشئ ملف {KILL_FILE}")
     print("═" * 55)
     HTTPServer(("0.0.0.0", PORT), H).serve_forever()

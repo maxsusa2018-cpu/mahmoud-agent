@@ -3,7 +3,7 @@
 """
 ═══════════════════════════════════════════════════════════════
   وكيل محمود — Pionex Perpetual Futures
-  الإصدار 0.2 · 1 أغسطس 2026 · وضع ورقي (لا تنفيذ حقيقي)
+  الإصدار 0.4 · 1 أغسطس 2026 · وضع ورقي (لا تنفيذ حقيقي)
 ═══════════════════════════════════════════════════════════════
 
   المبدأ: المؤشرات حسّاسات تبلّغ فقط. هذا الملف هو العقل الوحيد.
@@ -11,6 +11,17 @@
 
   تغيير 0.2:  «إجمالي الأحداث» كان يعدّ أسطر العرض (25 كحد أقصى)
               لا الأحداث الفعلية — والآن يعدّ كل سطر في الدفتر.
+
+  تغيير 0.4:  الطابور — إشارة تُرفض بسبب البوابة تُحفظ SIGNAL_TTL_MIN
+              دقيقة بدل أن تُنسى. لحظة فتح البوابة تُفحص وتُنفّذ إن
+              وافقت اتجاهها. لا يتجاوز البوابة — ينتظرها.
+
+  تغيير 0.3:  (1) الفتح الأول للبوابة من صفر صار فورياً. مهلة الأربع
+                  ساعات تبقى على الانقلاب (LONG↔SHORT) وحده، حيث
+                  توجد صفقات مفتوحة تستحق الحراسة.
+              (2) انقلاب البوابة لم يعد يغلق الصفقات. يشدّ الستوب إلى
+                  نقطة الدخول ويمنع الدخول الجديد فقط — الصفقة تُدار
+                  بشروطها هي. السبب: تذبذب البوابة كان يذبح الصفقات.
 
   التشغيل:   python3 agent.py
   الإيقاف الفوري:  أنشئ ملفاً اسمه KILL في نفس المجلد
@@ -162,6 +173,12 @@ class State:
         if d == self.gate_dir:
             self.pending_dir = 0
             return "confirm"
+        # ⭐ الفتح الأول من صفر = فوري. لا صفقات مفتوحة = لا شيء يُحرَس.
+        if self.gate_dir == 0:
+            self.gate_dir, self.gate_since = d, ts
+            self.pending_dir = 0
+            return "open"
+        # ── ما تحت هذا السطر انقلاب حقيقي (LONG↔SHORT) — الحراسة تبقى
         if self.pending_dir != d:
             self.pending_dir, self.pending_since = d, ts
             return "pending"
@@ -177,6 +194,8 @@ class State:
                 self.gate_dir, self.gate_since = self.pending_dir, now
                 self.pending_dir = 0
                 log("gate", {"event": "flip_by_timeout", "dir": self.gate_dir})
+                on_gate_flip(self.gate_dir)   # نفس المعالجة: شدّ الستوب لا إغلاق
+                drain_queue(now, self.gate_dir)
 
     def roll_day(self):
         if today() != self.day:
@@ -256,6 +275,14 @@ BROKER = PaperBroker()
 def try_entry(tk, d, src, price, now):
     why = vetoes(tk, d, now)
     if why:
+        # ⭐ الطابور: الرفض بسبب البوابة وحده قابل للاستئناف خلال SIGNAL_TTL_MIN.
+        #    لا يتجاوز البوابة — ينتظرها. إن لم تفتح في الوقت، تسقط الإشارة.
+        if why in ("gate_closed", "against_gate"):
+            QUEUE.append({"tk": tk, "dir": d, "src": src, "price": price, "ts": now})
+            log("queued", {"ticker": tk, "dir": d, "src": src, "price": price,
+                           "reason": why, "ttl_min": SIGNAL_TTL_MIN,
+                           "queue_len": len(QUEUE)})
+            return
         log("rejected", {"ticker": tk, "dir": d, "src": src, "reason": why})
         return
     log("armed", {"ticker": tk, "dir": d, "src": src, "price": price,
@@ -288,6 +315,47 @@ def execute(tk, d, src, ref_price):
         log("OPEN", {"ticker": tk, "dir": "LONG" if d > 0 else "SHORT", "src": src,
                      "entry": p, "sl": round(sl, 6), "margin": MARGIN_USD, "lev": LEVERAGE})
         ST.save()
+
+
+# ═══════════════════════════════════════════════════════════════
+#  الطابور — إشارات سبقت البوابة بدقائق
+# ═══════════════════════════════════════════════════════════════
+
+QUEUE = []   # [{tk, dir, src, price, ts}]  — في الذاكرة، عمرها دقائق
+
+def drain_queue(now, gate_dir):
+    """
+    يُستدعى لحظة فتح البوابة أو انقلابها.
+    لا يتجاوز البوابة إطلاقاً — ينفّذ ما يوافق اتجاهها فقط،
+    وما زال داخل مهلة SIGNAL_TTL_MIN. الباقي يسقط.
+    """
+    global QUEUE
+    if not QUEUE:
+        return
+    kept, fired, expired, wrong = [], 0, 0, 0
+    # الأحدث أولاً — الأقرب للسعر الحالي أصدق
+    for s in sorted(QUEUE, key=lambda x: x["ts"], reverse=True):
+        age_min = (now - s["ts"]).total_seconds() / 60
+        if age_min > SIGNAL_TTL_MIN:
+            expired += 1; continue
+        if s["dir"] != gate_dir:
+            wrong += 1; continue
+        why = vetoes(s["tk"], s["dir"], now)
+        if why:
+            # ما زال ممنوعاً لسبب آخر (حد يومي/مفتوحة) — يبقى في الطابور
+            if why in ("gate_closed", "against_gate"):
+                kept.append(s)
+            else:
+                log("queue_dropped", {"ticker": s["tk"], "src": s["src"],
+                                      "reason": why, "age_min": round(age_min, 1)})
+            continue
+        log("queue_fired", {"ticker": s["tk"], "dir": s["dir"], "src": s["src"],
+                            "price": s["price"], "age_min": round(age_min, 1)})
+        try_entry(s["tk"], s["dir"], s["src"], s["price"], now)
+        fired += 1
+    QUEUE = kept
+    log("queue_drain", {"fired": fired, "expired": expired,
+                        "wrong_dir": wrong, "remaining": len(QUEUE)})
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -356,11 +424,27 @@ def on_exit_signal(role, now, price_map):
         close_position(tk, 0.5, f"exit_signal:{role}", p)
 
 def on_gate_flip(new_dir):
-    """شبكة الأمان: انقلاب البوابة يغلق كل ما يعاكسها"""
+    """
+    ⭐ انقلاب البوابة لا يغلق شيئاً — يشدّ الستوب لنقطة الدخول فقط.
+    السبب: تذبذب البوابة (فتح·قفل·فتح) كان يذبح الصفقات عند نقاط عشوائية.
+    الصفقة بعد فتحها تُدار بشروطها هي: الستوب · الهدف · إشارات القمة/القاع.
+    والبوابة المنقلبة تمنع الدخول الجديد فقط.
+    ⚠️ الستوب لا يُحرَّك للأسفل أبداً — إن كان أقرب من الدخول يبقى مكانه.
+    """
     for tk, pos in list(ST.positions.items()):
-        if pos["side"] != new_dir:
-            p = ST.last_price.get(tk, (pos["entry"],))[0]
-            close_position(tk, 1.0, "gate_flip", p)
+        if pos["side"] == new_dir:
+            continue
+        old_sl, entry, d = pos["sl"], pos["entry"], pos["side"]
+        # الشدّ باتجاه واحد فقط: نحو الدخول، لا بعيداً عنه
+        new_sl = max(old_sl, entry) if d > 0 else min(old_sl, entry)
+        if new_sl != old_sl:
+            pos["sl"] = new_sl
+            log("gate_flip_breakeven", {"ticker": tk, "old_sl": round(old_sl, 6),
+                "new_sl": round(new_sl, 6), "note": "انقلاب البوابة — شدّ لا إغلاق"})
+        else:
+            log("gate_flip_hold", {"ticker": tk, "sl": round(old_sl, 6),
+                "note": "الستوب أضيق من الدخول أصلاً — بلا تغيير"})
+    ST.save()
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -414,6 +498,7 @@ def handle(msg):
             r = ST.set_gate(d, now)
             log("gate", {**base, "result": r, "gate_dir": ST.gate_dir})
             if r == "flip": on_gate_flip(d)
+            if r in ("open", "flip"): drain_queue(now, ST.gate_dir)
             ST.save()
 
         elif role in ("exit_top", "exit_bot"):
@@ -465,6 +550,7 @@ class H(BaseHTTPRequestHandler):
             "صفقات اليوم": ST.day_trades, "الرصيد": round(ST.balance, 3),
             "متوقف": ST.halted, "إجمالي الأحداث": total,
             "التخزين": "💾 دائم" if DATA_DIR != BASE else "⚠️ مؤقت",
+            "الطابور": len(QUEUE),
             "آخر الأحداث": tail[::-1],
         }
         out = json.dumps(body, ensure_ascii=False, indent=1).encode()
@@ -507,7 +593,7 @@ if __name__ == "__main__":
     if "--report" in sys.argv:
         report(); sys.exit(0)
     print("═" * 55)
-    print(f"  وكيل محمود 0.2  |  {'📝 ورقي' if PAPER_MODE else '⚠️ تنفيذ حقيقي'}")
+    print(f"  وكيل محمود 0.4  |  {'📝 ورقي' if PAPER_MODE else '⚠️ تنفيذ حقيقي'}")
     print(f"  المنفذ {PORT}  |  المسار: /{SECRET}")
     print(f"  البيانات: {DATA_DIR}  {'💾 دائم' if DATA_DIR != BASE else '⚠️ مؤقت — تُمسح عند إعادة النشر'}")
     print(f"  إيقاف فوري: أنشئ ملف {KILL_FILE}")

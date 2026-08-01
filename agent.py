@@ -3,11 +3,14 @@
 """
 ═══════════════════════════════════════════════════════════════
   وكيل محمود — Pionex Perpetual Futures
-  الإصدار 0.1 · 31 يوليو 2026 · وضع ورقي (لا تنفيذ حقيقي)
+  الإصدار 0.2 · 1 أغسطس 2026 · وضع ورقي (لا تنفيذ حقيقي)
 ═══════════════════════════════════════════════════════════════
 
   المبدأ: المؤشرات حسّاسات تبلّغ فقط. هذا الملف هو العقل الوحيد.
   أربعة منها عمياء عن السوق — فالفيتو هنا مركزياً لا داخل السكربتات.
+
+  تغيير 0.2:  «إجمالي الأحداث» كان يعدّ أسطر العرض (25 كحد أقصى)
+              لا الأحداث الفعلية — والآن يعدّ كل سطر في الدفتر.
 
   التشغيل:   python3 agent.py
   الإيقاف الفوري:  أنشئ ملفاً اسمه KILL في نفس المجلد
@@ -440,22 +443,27 @@ class H(BaseHTTPRequestHandler):
         except Exception as e:
             log("error", {"exc": str(e), "body": body[:200]})
     def do_GET(self):
-        tail = []
+        # ── إجمالي الأحداث = كل أسطر الدفتر، لا الـ25 المعروضة فقط
+        tail = []; total = 0
         try:
             with open(LEDGER) as f:
-                for l in f.readlines()[-25:]:
-                    r = json.loads(l)
-                    tail.append(f"{r['ts'][11:19]} · {r['kind']} · "
-                                f"{r.get('ticker') or r.get('src') or ''} "
-                                f"{r.get('reason') or ''}".strip())
+                lines = f.readlines()
+            total = len(lines)
+            for l in lines[-25:]:
+                r = json.loads(l)
+                tail.append(f"{r['ts'][11:19]} · {r['kind']} · "
+                            f"{r.get('ticker') or r.get('src') or ''} "
+                            f"{r.get('reason') or ''}".strip())
         except Exception:
+            pass
+        if not tail:
             tail = ["لا توجد أحداث بعد"]
         body = {
             "الحالة": "ورقي" if PAPER_MODE else "تنفيذ حقيقي",
             "البوابة": {1: "LONG", -1: "SHORT", 0: "مقفولة"}.get(ST.gate_dir),
             "معلّق": ST.pending_dir, "صفقات مفتوحة": list(ST.positions),
             "صفقات اليوم": ST.day_trades, "الرصيد": round(ST.balance, 3),
-            "متوقف": ST.halted, "إجمالي الأحداث": len(tail),
+            "متوقف": ST.halted, "إجمالي الأحداث": total,
             "التخزين": "💾 دائم" if DATA_DIR != BASE else "⚠️ مؤقت",
             "آخر الأحداث": tail[::-1],
         }
@@ -499,7 +507,7 @@ if __name__ == "__main__":
     if "--report" in sys.argv:
         report(); sys.exit(0)
     print("═" * 55)
-    print(f"  وكيل محمود 0.1  |  {'📝 ورقي' if PAPER_MODE else '⚠️ تنفيذ حقيقي'}")
+    print(f"  وكيل محمود 0.2  |  {'📝 ورقي' if PAPER_MODE else '⚠️ تنفيذ حقيقي'}")
     print(f"  المنفذ {PORT}  |  المسار: /{SECRET}")
     print(f"  البيانات: {DATA_DIR}  {'💾 دائم' if DATA_DIR != BASE else '⚠️ مؤقت — تُمسح عند إعادة النشر'}")
     print(f"  إيقاف فوري: أنشئ ملف {KILL_FILE}")

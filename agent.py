@@ -544,6 +544,7 @@ class H(BaseHTTPRequestHandler):
         if not tail:
             tail = ["لا توجد أحداث بعد"]
         body = {
+            "الإصدار": "0.4",
             "الحالة": "ورقي" if PAPER_MODE else "تنفيذ حقيقي",
             "البوابة": {1: "LONG", -1: "SHORT", 0: "مقفولة"}.get(ST.gate_dir),
             "معلّق": ST.pending_dir, "صفقات مفتوحة": list(ST.positions),

@@ -3,7 +3,7 @@
 """
 ═══════════════════════════════════════════════════════════════
   وكيل محمود — Pionex Perpetual Futures
-  الإصدار 0.4 · 1 أغسطس 2026 · وضع ورقي (لا تنفيذ حقيقي)
+  الإصدار 0.5 · 1 أغسطس 2026 · وضع ورقي (لا تنفيذ حقيقي)
 ═══════════════════════════════════════════════════════════════
 
   المبدأ: المؤشرات حسّاسات تبلّغ فقط. هذا الملف هو العقل الوحيد.
@@ -11,6 +11,11 @@
 
   تغيير 0.2:  «إجمالي الأحداث» كان يعدّ أسطر العرض (25 كحد أقصى)
               لا الأحداث الفعلية — والآن يعدّ كل سطر في الدفتر.
+
+  تغيير 0.5:  الإشارة المكررة على عملة مفتوحة تُوثَّق قبل رفضها:
+              سعرها · سعر الدخول · الفارق % · الفارق بالدقائق · حكم
+              مبدئي (تأكيد / سكين / غامض). السلوك لم يتغيّر — الرفض
+              كما هو، لكن السجل صار قادراً على الفصل بعد أسبوع.
 
   تغيير 0.4:  الطابور — إشارة تُرفض بسبب البوابة تُحفظ SIGNAL_TTL_MIN
               دقيقة بدل أن تُنسى. لحظة فتح البوابة تُفحص وتُنفّذ إن
@@ -283,6 +288,32 @@ def try_entry(tk, d, src, price, now):
                            "reason": why, "ttl_min": SIGNAL_TTL_MIN,
                            "queue_len": len(QUEUE)})
             return
+        # ⭐ الإشارة المكررة على عملة مفتوحة — تُرفض كما كانت، لكن تُوثَّق.
+        #    السجل يفرّق لاحقاً بين قاع مزدوج (أعلى + بعد ساعات = تأكيد ضائع)
+        #    وسكين هابطة (أدنى + خلال دقائق = الرفض أنقذك).
+        if why == "already_open":
+            pos = ST.positions.get(tk, {})
+            e   = pos.get("entry")
+            oa  = pos.get("opened_at")
+            gap = None
+            try:
+                gap = round((now - datetime.fromisoformat(oa)).total_seconds() / 60, 1)
+            except Exception:
+                pass
+            delta = None; verdict = "?"
+            if e and price:
+                # الفارق بمنظور الاتجاه: موجب = الإشارة الثانية أفضل من الدخول
+                delta = round((price - e) / e * 100 * d, 3)
+                far   = (gap is None or gap >= 60)
+                if delta >= 0 and far:      verdict = "تأكيد محتمل (أفضل + بعيد)"
+                elif delta < -0.5 and gap is not None and gap < 30:
+                    verdict = "⚠️ سكين محتملة (أسوأ + قريب)"
+                else:                        verdict = "غامض"
+            log("repeat_signal", {"ticker": tk, "dir": d, "src": src,
+                                  "sig_price": price, "entry": e,
+                                  "delta_pct": delta, "gap_min": gap,
+                                  "verdict": verdict, "reason": why})
+            return
         log("rejected", {"ticker": tk, "dir": d, "src": src, "reason": why})
         return
     log("armed", {"ticker": tk, "dir": d, "src": src, "price": price,
@@ -544,7 +575,7 @@ class H(BaseHTTPRequestHandler):
         if not tail:
             tail = ["لا توجد أحداث بعد"]
         body = {
-            "الإصدار": "0.4",
+            "الإصدار": "0.5",
             "الحالة": "ورقي" if PAPER_MODE else "تنفيذ حقيقي",
             "البوابة": {1: "LONG", -1: "SHORT", 0: "مقفولة"}.get(ST.gate_dir),
             "معلّق": ST.pending_dir, "صفقات مفتوحة": list(ST.positions),
@@ -594,7 +625,7 @@ if __name__ == "__main__":
     if "--report" in sys.argv:
         report(); sys.exit(0)
     print("═" * 55)
-    print(f"  وكيل محمود 0.4  |  {'📝 ورقي' if PAPER_MODE else '⚠️ تنفيذ حقيقي'}")
+    print(f"  وكيل محمود 0.5  |  {'📝 ورقي' if PAPER_MODE else '⚠️ تنفيذ حقيقي'}")
     print(f"  المنفذ {PORT}  |  المسار: /{SECRET}")
     print(f"  البيانات: {DATA_DIR}  {'💾 دائم' if DATA_DIR != BASE else '⚠️ مؤقت — تُمسح عند إعادة النشر'}")
     print(f"  إيقاف فوري: أنشئ ملف {KILL_FILE}")

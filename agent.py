@@ -3,7 +3,7 @@
 """
 ═══════════════════════════════════════════════════════════════
   وكيل محمود — Pionex Perpetual Futures
-  الإصدار 0.6 · 2 أغسطس 2026 · وضع ورقي (لا تنفيذ حقيقي)
+  الإصدار 0.7 · 2 أغسطس 2026 · وضع ورقي (لا تنفيذ حقيقي)
 ═══════════════════════════════════════════════════════════════
 
   المبدأ: المؤشرات حسّاسات تبلّغ فقط. هذا الملف هو العقل الوحيد.
@@ -34,6 +34,21 @@
                   نقطة الدخول ويمنع الدخول الجديد فقط — الصفقة تُدار
                   بشروطها هي. السبب: تذبذب البوابة كان يذبح الصفقات.
 
+  تغيير 0.7:  بوابتان متوازيتان — «هيكن» و«الخام» — كل منهما تصل عبر
+              تنبيه ببادئته (🚦HA / 🚦RAW) ولها مقعداها المستقلان.
+              لا مشاركة بين الميزانيتين: لو تقاسمتا مقعداً لفاز الأسرع
+              دائماً، فيقيس الاختبار السرعة لا الجودة.
+              + دفتر الظل: كل إشارة تُسجَّل ولو رُفضت، ومعها حالتا
+                البوابتين وسعر ما بعد أربع ساعات. العيّنة ×5.
+              + حقل gate_source على كل صفقة — هو الاختبار كله.
+
+  قاعدة الحسم (مقفلة مسبقاً، لا تُعدَّل بعد رؤية النتائج):
+              40 قيد ظل لكل بوابة أو 14 يوماً — أيهما أسبق.
+              المقياس: نسبة الإشارات التي تحرّك السعر في الاتجاه
+              المسموح بعد 4 ساعات.
+              فارق ≥10 نقاط مئوية → الفائز يُعتمد والخاسر يُحذف.
+              فارق <10 → يُعتمد هيكن (أبسط) ويُعاد القياس.
+
   التشغيل:   python3 agent.py
   الإيقاف الفوري:  أنشئ ملفاً اسمه KILL في نفس المجلد
   التقرير:   python3 agent.py --report
@@ -63,9 +78,19 @@ LEVERAGE          = 25          # الرافعة
 TP_PCT            = 50.0        # هدف المرحلة 1 (25x → 50% = حركة 2%)
 SL_PCT            = 50.0        # الستوب الابتدائي (% من الهامش)
 
-MAX_DAILY_TRADES  = 3           # حد الصفقات اليومي
-MAX_OPEN          = 3           # أقصى صفقات مفتوحة معاً
+CONFIG_VERSION    = "0.7"       # يُكتب مع كل حدث — لفصل عيّنة البوابتين عمّا قبلها
+
+MAX_DAILY_TRADES  = 5           # حد الصفقات اليومي (كان 3 — رُفع ليكفي بوابتين)
+MAX_OPEN          = 5           # 2 هيكن + 2 خام + 1 استكشاف
 ONE_PER_TICKER    = True        # صفقة واحدة لكل عملة
+
+# ── ميزانية المقاعد: ثابتة لكل بوابة، لا تُشارَك
+#    مقعد شاغر في بوابة لا يُعطى للأخرى. يبقى شاغراً.
+SLOT_HA           = 2
+SLOT_RAW          = 2
+SLOT_EXPLORE      = 1           # لنوع إشارة غير ممثَّل بين المفتوحات
+
+SHADOW_FOLLOW_MIN = 240         # بعد كم دقيقة يُسجَّل سعر المتابعة للظل
 
 EXEC_DELAY_SEC    = 150         # تأخير التنفيذ (فخ ما بعد الإغلاق — قاعدة 26 يونيو)
 ADVERSE_CANCEL    = 0.4         # إن تحرّك السعر ضدك % خلال التأخير = ألغِ
@@ -108,14 +133,22 @@ def classify(msg: str):
     """يحوّل نص التنبيه إلى (الدور، الاتجاه). الدور: gate/entry/exit_top/exit_bot/veto"""
     m = msg.replace("\u200f", "").strip()
 
-    # ── البوابة (ماستر 4h)
-    if "القرار:" in m and "Alts" in m:
-        if "LONG" in m:  return ("gate", +1, "master_decision")
-        if "SHORT" in m: return ("gate", -1, "master_decision")
+    # ── البوابتان: تُميَّزان بالبادئة حصراً. رسالة بلا بادئة معروفة
+    #    لا تُحدِّث أي بوابة — بدون هذا الحارس يفسد الاختبار من أول يوم.
+    which = "ha" if m.startswith("🚦HA") else ("raw" if m.startswith("🚦RAW") else None)
+    if which:
+        role = "gate_" + which
+        if "القرار:" in m and "Alts" in m:
+            if "LONG" in m:  return (role, +1, "master_" + which)
+            if "SHORT" in m: return (role, -1, "master_" + which)
+        # المحايد يُفحص بعد LONG/SHORT عمداً كي لا يسبقهما
+        if "القرار:" in m and any(k in m for k in NEUTRAL_KEYS):
+            return (role, 0, "neutral_" + which)
+        return (None, 0, "gate_bad_format")
 
-    # ── البوابة المحايدة — تُفحص بعد LONG/SHORT عمداً كي لا تسبقهما
-    if "القرار:" in m and any(k in m for k in NEUTRAL_KEYS):
-        return ("gate", 0, "master_neutral")
+    # ── بوابة قديمة بلا بادئة (نسخة Master ما قبل v15) — تُسجَّل ولا تُطبَّق
+    if "القرار:" in m and ("Alts" in m or any(k in m for k in NEUTRAL_KEYS)):
+        return (None, 0, "gate_unknown_prefix")
 
     # ── إشارات الخروج (ماستر)
     if "انعكاس قمة" in m and "مُنهَك" in m:      return ("exit_top", -1, "heikin_top")
@@ -149,7 +182,7 @@ WEIGHT = {"unified_confluence": 5, "unified_early": 4, "unified_classic": 4,
           "wyckoff": 3, "wolfe": 3, "scanner_b": 2, "bb_rejection": 2}
 
 # الفريم المتوقع لكل دور — حماية من ربط الرابط بالنسخة الخطأ
-EXPECTED_TF = {"master_decision": {"240", "4h"},
+EXPECTED_TF = {"master_raw": {"240", "4h"}, "master_ha": {"240", "4h"},
                "heikin_top": {"60", "1h"}, "heikin_bot": {"60", "1h"},
                "trigger_top": {"15"}, "trigger_bot": {"15"}}
 
@@ -163,7 +196,7 @@ def today():   return now_utc().strftime("%Y-%m-%d")
 
 def log(kind, data):
     """دفتر الظل — كل شيء يُسجّل: المقبول والمرفوض وسببه"""
-    rec = {"ts": now_utc().isoformat(), "kind": kind, **data}
+    rec = {"ts": now_utc().isoformat(), "kind": kind, "cfg": CONFIG_VERSION, **data}
     try:
         with open(LEDGER, "a") as f: f.write(json.dumps(rec, ensure_ascii=False) + "\n")
     except Exception as e:
@@ -173,10 +206,15 @@ def log(kind, data):
 
 class State:
     def __init__(self):
-        self.gate_dir      = 0      # +1 لونج / -1 شورت / 0 مقفول
+        # ── بوابتان مستقلتان تماماً. G["raw"] هي القديمة، G["ha"] الجديدة.
+        self.gate_dir      = 0      # الخام — الاسم محفوظ للتوافق مع state.json القديم
         self.gate_since    = None
-        self.pending_dir   = 0      # انقلاب قيد التأكيد
+        self.pending_dir   = 0
         self.pending_since = None
+        self.gate_ha       = 0      # هيكن
+        self.gate_ha_since = None
+        self.pending_ha    = 0
+        self.pending_ha_since = None
         self.positions     = {}     # ticker -> dict
         self.day           = today()
         self.day_trades    = 0
@@ -186,46 +224,55 @@ class State:
         self.last_price    = {}     # ticker -> (price, ts)
         self.load()
 
-    # ── البوابة مع فلتر الانقلاب القصير
-    def set_gate(self, d, ts):
-        if d == self.gate_dir:
-            self.pending_dir = 0
+    # ── أسماء الحقول لكل بوابة (raw يحتفظ بالأسماء القديمة)
+    F = {"raw": ("gate_dir", "gate_since", "pending_dir", "pending_since"),
+         "ha":  ("gate_ha",  "gate_ha_since", "pending_ha", "pending_ha_since")}
+
+    def gate(self, which):
+        return getattr(self, self.F[which][0])
+
+    # ── البوابة مع فلتر الانقلاب القصير — نفس المنطق، مطبَّق على أي بوابة
+    def set_gate(self, d, ts, which="raw"):
+        gd, gs, pd_, ps = self.F[which]
+        if d == getattr(self, gd):
+            setattr(self, pd_, 0)
             return "confirm"
         # ⭐ الفتح الأول من صفر = فوري. لا صفقات مفتوحة = لا شيء يُحرَس.
-        if self.gate_dir == 0:
-            self.gate_dir, self.gate_since = d, ts
-            self.pending_dir = 0
+        if getattr(self, gd) == 0:
+            setattr(self, gd, d); setattr(self, gs, ts); setattr(self, pd_, 0)
             return "open"
         # ── ما تحت هذا السطر انقلاب حقيقي (LONG↔SHORT) — الحراسة تبقى
-        if self.pending_dir != d:
-            self.pending_dir, self.pending_since = d, ts
+        if getattr(self, pd_) != d:
+            setattr(self, pd_, d); setattr(self, ps, ts)
             return "pending"
         # نفس الاتجاه المعلّق وصل مرة ثانية = تأكيد فوري
-        self.gate_dir, self.gate_since = d, ts
-        self.pending_dir = 0
+        setattr(self, gd, d); setattr(self, gs, ts); setattr(self, pd_, 0)
         return "flip"
 
     # ── البوابة المحايدة: لا اتجاه، ولا انتظار أربع ساعات
-    def set_neutral(self, ts):
+    def set_neutral(self, ts, which="raw"):
         """
         يُصفّر البوابة ويُلغي أي انقلاب معلّق. لا مهلة هنا:
         الحراسة الأربع-ساعات وُضعت لمنع دخول عكسي متسرّع، والمحايد
         لا يفتح شيئاً أصلاً — يمنع فقط. فتأخيره ضرر بلا مقابل.
         """
-        prev = self.gate_dir
-        self.gate_dir, self.gate_since = 0, ts
-        self.pending_dir, self.pending_since = 0, None
+        gd, gs, pd_, ps = self.F[which]
+        prev = getattr(self, gd)
+        setattr(self, gd, 0); setattr(self, gs, ts)
+        setattr(self, pd_, 0); setattr(self, ps, None)
         return prev
 
     def check_pending(self, now):
-        """الانقلاب المعلّق يُعتمد إن نجا 4 ساعات بلا تناقض"""
-        if self.pending_dir and self.pending_since:
-            if (now - self.pending_since).total_seconds() >= GATE_FLIP_MIN * 60:
-                self.gate_dir, self.gate_since = self.pending_dir, now
-                self.pending_dir = 0
-                log("gate", {"event": "flip_by_timeout", "dir": self.gate_dir})
-                on_gate_flip(self.gate_dir)   # نفس المعالجة: شدّ الستوب لا إغلاق
-                drain_queue(now, self.gate_dir)
+        """الانقلاب المعلّق يُعتمد إن نجا 4 ساعات بلا تناقض — للبوابتين"""
+        for which in ("raw", "ha"):
+            gd, gs, pd_, ps = self.F[which]
+            pdir, psince = getattr(self, pd_), getattr(self, ps)
+            if pdir and psince:
+                if (now - psince).total_seconds() >= GATE_FLIP_MIN * 60:
+                    setattr(self, gd, pdir); setattr(self, gs, now); setattr(self, pd_, 0)
+                    log("gate", {"event": "flip_by_timeout", "gate": which, "dir": pdir})
+                    on_gate_flip(pdir)   # نفس المعالجة: شدّ الستوب لا إغلاق
+                    drain_queue(now, which)
 
     def roll_day(self):
         if today() != self.day:
@@ -269,17 +316,27 @@ def news_blackout(now):
             return name
     return None
 
-def vetoes(tk, d, now):
-    """يرجع سبب الرفض أو None. الترتيب من الأهم للأقل."""
+def slots_used(source):
+    """عدد المفتوحات المحسوبة على ميزانية بوابة بعينها"""
+    return sum(1 for p in ST.positions.values() if p.get("gate_source") == source)
+
+SLOT_CAP = {"ha": SLOT_HA, "raw": SLOT_RAW, "explore": SLOT_EXPLORE}
+
+def vetoes(tk, d, now, which="raw"):
+    """يرجع سبب الرفض أو None. الترتيب من الأهم للأقل.
+       which = البوابة التي يُطلب الدخول تحت إذنها."""
     if os.path.exists(KILL_FILE):            return "kill_switch"
     if ST.halted:                            return "halted_drawdown"
     n = news_blackout(now)
     if n:                                    return f"news_blackout:{n}"
-    if ST.gate_dir == 0:                     return "gate_closed"
-    if ST.gate_dir != d:                     return "against_gate"     # ← 8 من 17 في بياناتك
+    g = ST.gate(which)
+    if g == 0:                               return "gate_closed"
+    if g != d:                               return "against_gate"
     ST.roll_day()
     if ST.day_trades >= MAX_DAILY_TRADES:    return "daily_limit"
     if len(ST.positions) >= MAX_OPEN:        return "max_open"
+    # ⭐ الميزانية المستقلة: مقعد شاغر في بوابة لا يُعطى للأخرى
+    if slots_used(which) >= SLOT_CAP[which]: return "slots_full_" + which
     if ONE_PER_TICKER and tk in ST.positions: return "already_open"
     return None
 
@@ -302,8 +359,49 @@ BROKER = PaperBroker()
 #  الدخول
 # ═══════════════════════════════════════════════════════════════
 
+def open_srcs():
+    return {p.get("src") for p in ST.positions.values()}
+
+def pick_gate(tk, d, now):
+    """
+    يرجع (البوابة المختارة، سبب الرفض، هل فيه تعارض).
+    التعارض = بوابة تسمح والأخرى تمنع. تُفتح الصفقة وتُسجَّل —
+    الحالة المتعارضة أثمن من عشر متفقات، وفيها يظهر الفرق حرفياً.
+    """
+    res = {w: vetoes(tk, d, now, w) for w in ("ha", "raw")}
+    ok  = [w for w in ("ha", "raw") if res[w] is None]
+    permits = [w for w in ("ha", "raw") if ST.gate(w) == d]
+    conflict = len(permits) == 1
+    if ok:
+        return ok[0], None, conflict
+    # ⭐ المقعد الاستكشافي: البوابتان ممتلئتان لكن إحداهما تأذن،
+    #    والإشارة من نوع غير ممثَّل بين المفتوحات = تُؤخذ لتنويع العيّنة قسراً
+    return None, (res["ha"] if res["ha"] == res["raw"] else res.get(permits[0]) if permits else res["raw"]), conflict
+
 def try_entry(tk, d, src, price, now):
-    why = vetoes(tk, d, now)
+    which, why, conflict = pick_gate(tk, d, now)
+
+    # ── دفتر الظل: كل إشارة تُسجَّل ولو رُفضت. هذا ما يوسّع العيّنة ×5
+    log("shadow", {"ticker": tk, "dir": d, "src": src, "price": price,
+                   "gate_ha": ST.gate("ha"), "gate_raw": ST.gate("raw"),
+                   "executed": bool(which), "gate_source": which,
+                   "conflict": conflict, "reason": why})
+    if price:
+        threading.Timer(SHADOW_FOLLOW_MIN * 60, shadow_follow,
+                        args=(tk, d, src, price, now.isoformat())).start()
+
+    if which is None:
+        # ⭐ المقعد الاستكشافي — نوع لم يظهر بين المفتوحات
+        for w in ("ha", "raw"):
+            if ST.gate(w) == d and src not in open_srcs() \
+               and slots_used("explore") < SLOT_EXPLORE \
+               and len(ST.positions) < MAX_OPEN \
+               and not (ONE_PER_TICKER and tk in ST.positions) \
+               and ST.day_trades < MAX_DAILY_TRADES and not ST.halted:
+                log("explore_slot", {"ticker": tk, "src": src, "gate": w})
+                which, why = "explore", None
+                break
+
     if why:
         # ⭐ الطابور: الرفض بسبب البوابة وحده قابل للاستئناف خلال SIGNAL_TTL_MIN.
         #    لا يتجاوز البوابة — ينتظرها. إن لم تفتح في الوقت، تسقط الإشارة.
@@ -342,13 +440,26 @@ def try_entry(tk, d, src, price, now):
         log("rejected", {"ticker": tk, "dir": d, "src": src, "reason": why})
         return
     log("armed", {"ticker": tk, "dir": d, "src": src, "price": price,
+                  "gate_source": which, "conflict": conflict,
                   "delay_sec": EXEC_DELAY_SEC})
-    threading.Timer(EXEC_DELAY_SEC, execute, args=(tk, d, src, price)).start()
+    threading.Timer(EXEC_DELAY_SEC, execute,
+                    args=(tk, d, src, price, which, conflict)).start()
 
-def execute(tk, d, src, ref_price):
+
+def shadow_follow(tk, d, src, ref_price, ref_ts):
+    """سعر ما بعد أربع ساعات — هو المقياس في قاعدة الحسم"""
+    p = ST.last_price.get(tk, (None, None))[0]
+    mv = None
+    if p and ref_price:
+        mv = round((p - ref_price) / ref_price * 100 * d, 3)
+    log("shadow_result", {"ticker": tk, "src": src, "ref_ts": ref_ts,
+                          "ref_price": ref_price, "price_4h": p,
+                          "move_pct": mv, "hit": (mv is not None and mv > 0)})
+
+def execute(tk, d, src, ref_price, which="raw", conflict=False):
     with LOCK:
         now = now_utc()
-        why = vetoes(tk, d, now)
+        why = None if which == "explore" else vetoes(tk, d, now, which)
         if why:
             log("rejected_after_delay", {"ticker": tk, "src": src, "reason": why}); return
 
@@ -366,10 +477,13 @@ def execute(tk, d, src, ref_price):
 
         sl = p * (1 - SL_PCT / 100 / LEVERAGE) if d > 0 else p * (1 + SL_PCT / 100 / LEVERAGE)
         ST.positions[tk] = {"side": d, "entry": p, "sl": sl, "src": src,
-                            "half": False, "peak": p, "opened_at": now.isoformat()}
+                            "half": False, "peak": p, "opened_at": now.isoformat(),
+                            "gate_source": which, "conflict": conflict}
         ST.day_trades += 1
         log("OPEN", {"ticker": tk, "dir": "LONG" if d > 0 else "SHORT", "src": src,
-                     "entry": p, "sl": round(sl, 6), "margin": MARGIN_USD, "lev": LEVERAGE})
+                     "entry": p, "sl": round(sl, 6), "margin": MARGIN_USD, "lev": LEVERAGE,
+                     "gate_source": which, "conflict": conflict,
+                     "slots": {w: slots_used(w) for w in ("ha", "raw", "explore")}})
         ST.save()
 
 
@@ -379,7 +493,7 @@ def execute(tk, d, src, ref_price):
 
 QUEUE = []   # [{tk, dir, src, price, ts}]  — في الذاكرة، عمرها دقائق
 
-def drain_queue(now, gate_dir):
+def drain_queue(now, which="raw"):
     """
     يُستدعى لحظة فتح البوابة أو انقلابها.
     لا يتجاوز البوابة إطلاقاً — ينفّذ ما يوافق اتجاهها فقط،
@@ -394,9 +508,9 @@ def drain_queue(now, gate_dir):
         age_min = (now - s["ts"]).total_seconds() / 60
         if age_min > SIGNAL_TTL_MIN:
             expired += 1; continue
-        if s["dir"] != gate_dir:
+        if s["dir"] != ST.gate(which):
             wrong += 1; continue
-        why = vetoes(s["tk"], s["dir"], now)
+        why = vetoes(s["tk"], s["dir"], now, which)
         if why:
             # ما زال ممنوعاً لسبب آخر (حد يومي/مفتوحة) — يبقى في الطابور
             if why in ("gate_closed", "against_gate"):
@@ -410,7 +524,7 @@ def drain_queue(now, gate_dir):
         try_entry(s["tk"], s["dir"], s["src"], s["price"], now)
         fired += 1
     QUEUE = kept
-    log("queue_drain", {"fired": fired, "expired": expired,
+    log("queue_drain", {"gate": which, "fired": fired, "expired": expired,
                         "wrong_dir": wrong, "remaining": len(QUEUE)})
 
 
@@ -550,19 +664,23 @@ def handle(msg):
     if px: on_price(tk, px, now)
 
     with LOCK:
-        if role == "gate":
+        if role in ("gate_ha", "gate_raw"):
+            which = role.split("_")[1]
             if d == 0:
-                prev = ST.set_neutral(now)
+                prev = ST.set_neutral(now, which)
                 ST.save()
-                log("gate_neutral", {**base, "prev_gate": prev, "gate_dir": 0,
+                log("gate_neutral", {**base, "gate": which, "prev_gate": prev,
+                                     "gate_ha": ST.gate("ha"), "gate_raw": ST.gate("raw"),
                                      "open_positions": list(ST.positions),
                                      "queued": len(QUEUE),
                                      "note": "منع دخول جديد — الصفقات المفتوحة تُدار بشروطها"})
             else:
-                r = ST.set_gate(d, now)
-                log("gate", {**base, "result": r, "gate_dir": ST.gate_dir})
+                r = ST.set_gate(d, now, which)
+                log("gate", {**base, "gate": which, "result": r,
+                             "gate_ha": ST.gate("ha"), "gate_raw": ST.gate("raw"),
+                             "conflict": ST.gate("ha") != ST.gate("raw")})
                 if r == "flip": on_gate_flip(d)
-                if r in ("open", "flip"): drain_queue(now, ST.gate_dir)
+                if r in ("open", "flip"): drain_queue(now, which)
                 ST.save()
 
         elif role in ("exit_top", "exit_bot"):
@@ -610,7 +728,10 @@ class H(BaseHTTPRequestHandler):
         body = {
             "الإصدار": "0.6",
             "الحالة": "ورقي" if PAPER_MODE else "تنفيذ حقيقي",
-            "البوابة": {1: "LONG", -1: "SHORT", 0: "مقفولة"}.get(ST.gate_dir),
+            "بوابة هيكن": {1: "LONG", -1: "SHORT", 0: "مقفولة"}.get(ST.gate("ha")),
+            "بوابة الخام": {1: "LONG", -1: "SHORT", 0: "مقفولة"}.get(ST.gate("raw")),
+            "تعارض البوابتين": ST.gate("ha") != ST.gate("raw"),
+            "المقاعد": {w: f"{slots_used(w)}/{SLOT_CAP[w]}" for w in ("ha", "raw", "explore")},
             "معلّق": ST.pending_dir, "صفقات مفتوحة": list(ST.positions),
             "صفقات اليوم": ST.day_trades, "الرصيد": round(ST.balance, 3),
             "متوقف": ST.halted, "إجمالي الأحداث": total,

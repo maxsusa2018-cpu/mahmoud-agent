@@ -3,7 +3,7 @@
 """
 ═══════════════════════════════════════════════════════════════
   وكيل محمود — Pionex Perpetual Futures
-  الإصدار 0.5 · 1 أغسطس 2026 · وضع ورقي (لا تنفيذ حقيقي)
+  الإصدار 0.6 · 2 أغسطس 2026 · وضع ورقي (لا تنفيذ حقيقي)
 ═══════════════════════════════════════════════════════════════
 
   المبدأ: المؤشرات حسّاسات تبلّغ فقط. هذا الملف هو العقل الوحيد.
@@ -11,6 +11,12 @@
 
   تغيير 0.2:  «إجمالي الأحداث» كان يعدّ أسطر العرض (25 كحد أقصى)
               لا الأحداث الفعلية — والآن يعدّ كل سطر في الدفتر.
+
+  تغيير 0.6:  البوابة صار لها حالة ثالثة فعلية: محايدة. قبل اليوم كانت
+              الصفر حالة ابتدائية فقط لا يعود إليها الكود أبداً. الآن
+              «خروج سيولة» أو «راقب» أو «محايد» تُصفّرها وتُلغي المعلّق —
+              بشرط وجود «القرار:» في الرسالة، كي لا تبتلع كلمةٌ شائعة
+              داخل تنبيه مؤشر بوابتَك خطأً.
 
   تغيير 0.5:  الإشارة المكررة على عملة مفتوحة تُوثَّق قبل رفضها:
               سعرها · سعر الدخول · الفارق % · الفارق بالدقائق · حكم
@@ -95,6 +101,9 @@ STATE_F   = os.path.join(DATA_DIR, "state.json")
 #  قاموس الإشارات — يطابق نصوص تنبيهاتك الفعلية
 # ═══════════════════════════════════════════════════════════════
 
+# كلمات البوابة المحايدة — تُقرأ فقط مع «القرار:» (النسخة المشدَّدة)
+NEUTRAL_KEYS = ("خروج سيولة", "راقب", "محايد")
+
 def classify(msg: str):
     """يحوّل نص التنبيه إلى (الدور، الاتجاه). الدور: gate/entry/exit_top/exit_bot/veto"""
     m = msg.replace("\u200f", "").strip()
@@ -103,6 +112,10 @@ def classify(msg: str):
     if "القرار:" in m and "Alts" in m:
         if "LONG" in m:  return ("gate", +1, "master_decision")
         if "SHORT" in m: return ("gate", -1, "master_decision")
+
+    # ── البوابة المحايدة — تُفحص بعد LONG/SHORT عمداً كي لا تسبقهما
+    if "القرار:" in m and any(k in m for k in NEUTRAL_KEYS):
+        return ("gate", 0, "master_neutral")
 
     # ── إشارات الخروج (ماستر)
     if "انعكاس قمة" in m and "مُنهَك" in m:      return ("exit_top", -1, "heikin_top")
@@ -191,6 +204,18 @@ class State:
         self.gate_dir, self.gate_since = d, ts
         self.pending_dir = 0
         return "flip"
+
+    # ── البوابة المحايدة: لا اتجاه، ولا انتظار أربع ساعات
+    def set_neutral(self, ts):
+        """
+        يُصفّر البوابة ويُلغي أي انقلاب معلّق. لا مهلة هنا:
+        الحراسة الأربع-ساعات وُضعت لمنع دخول عكسي متسرّع، والمحايد
+        لا يفتح شيئاً أصلاً — يمنع فقط. فتأخيره ضرر بلا مقابل.
+        """
+        prev = self.gate_dir
+        self.gate_dir, self.gate_since = 0, ts
+        self.pending_dir, self.pending_since = 0, None
+        return prev
 
     def check_pending(self, now):
         """الانقلاب المعلّق يُعتمد إن نجا 4 ساعات بلا تناقض"""
@@ -526,11 +551,19 @@ def handle(msg):
 
     with LOCK:
         if role == "gate":
-            r = ST.set_gate(d, now)
-            log("gate", {**base, "result": r, "gate_dir": ST.gate_dir})
-            if r == "flip": on_gate_flip(d)
-            if r in ("open", "flip"): drain_queue(now, ST.gate_dir)
-            ST.save()
+            if d == 0:
+                prev = ST.set_neutral(now)
+                ST.save()
+                log("gate_neutral", {**base, "prev_gate": prev, "gate_dir": 0,
+                                     "open_positions": list(ST.positions),
+                                     "queued": len(QUEUE),
+                                     "note": "منع دخول جديد — الصفقات المفتوحة تُدار بشروطها"})
+            else:
+                r = ST.set_gate(d, now)
+                log("gate", {**base, "result": r, "gate_dir": ST.gate_dir})
+                if r == "flip": on_gate_flip(d)
+                if r in ("open", "flip"): drain_queue(now, ST.gate_dir)
+                ST.save()
 
         elif role in ("exit_top", "exit_bot"):
             log("exit_signal", base)
@@ -575,7 +608,7 @@ class H(BaseHTTPRequestHandler):
         if not tail:
             tail = ["لا توجد أحداث بعد"]
         body = {
-            "الإصدار": "0.5",
+            "الإصدار": "0.6",
             "الحالة": "ورقي" if PAPER_MODE else "تنفيذ حقيقي",
             "البوابة": {1: "LONG", -1: "SHORT", 0: "مقفولة"}.get(ST.gate_dir),
             "معلّق": ST.pending_dir, "صفقات مفتوحة": list(ST.positions),
@@ -625,7 +658,7 @@ if __name__ == "__main__":
     if "--report" in sys.argv:
         report(); sys.exit(0)
     print("═" * 55)
-    print(f"  وكيل محمود 0.5  |  {'📝 ورقي' if PAPER_MODE else '⚠️ تنفيذ حقيقي'}")
+    print(f"  وكيل محمود 0.6  |  {'📝 ورقي' if PAPER_MODE else '⚠️ تنفيذ حقيقي'}")
     print(f"  المنفذ {PORT}  |  المسار: /{SECRET}")
     print(f"  البيانات: {DATA_DIR}  {'💾 دائم' if DATA_DIR != BASE else '⚠️ مؤقت — تُمسح عند إعادة النشر'}")
     print(f"  إيقاف فوري: أنشئ ملف {KILL_FILE}")

@@ -278,28 +278,44 @@ class State:
         if today() != self.day:
             self.day, self.day_trades = today(), 0
 
+    # حقول الوقت الأربعة — بوابتان × (منذ / معلّق منذ)
+    TS_FIELDS = ("gate_since", "pending_since", "gate_ha_since", "pending_ha_since")
+
     def save(self):
         d = {k: v for k, v in self.__dict__.items() if k != "last_price"}
-        for k in ("gate_since", "pending_since"):
-            d[k] = d[k].isoformat() if d[k] else None
-        for p in d["positions"].values():
-            if isinstance(p.get("opened_at"), datetime):
-                p["opened_at"] = p["opened_at"].isoformat()
+        # ① كل حقول الوقت الأربعة تُحوَّل نصاً (كانت اثنتان فقط — وحقلا هيكن
+        #    يكسران json.dump فيُفرَّغ الملف وتضيع الصفقات)
+        for k in self.TS_FIELDS:
+            v = d.get(k)
+            d[k] = v.isoformat() if isinstance(v, datetime) else None
+        # ② نسخة مستقلة للمراكز — لا نمسّ القاموس الحيّ في الذاكرة
+        d["positions"] = {
+            t: {**p, "opened_at": p["opened_at"].isoformat()
+                     if isinstance(p.get("opened_at"), datetime) else p.get("opened_at")}
+            for t, p in self.positions.items()
+        }
+        # ③ كتابة ذرّية — لو فشلت لا يُفرَّغ الملف القديم
         try:
-            with open(STATE_F, "w") as f: json.dump(d, f, ensure_ascii=False, indent=1)
+            tmp = STATE_F + ".tmp"
+            with open(tmp, "w") as f: json.dump(d, f, ensure_ascii=False, indent=1)
+            os.replace(tmp, STATE_F)
         except Exception as e:
-            print("save error:", e)
+            print("save error:", e, flush=True)
 
     def load(self):
         if not os.path.exists(STATE_F): return
         try:
-            d = json.load(open(STATE_F))
+            with open(STATE_F) as f: d = json.load(f)
             for k, v in d.items():
-                if k in ("gate_since", "pending_since") and v:
+                if k in self.TS_FIELDS and v:
                     v = datetime.fromisoformat(v)
                 setattr(self, k, v)
+            # ④ إرجاع opened_at إلى datetime — كان يبقى نصاً فينكسر أي حساب مدة
+            for p in self.positions.values():
+                if isinstance(p.get("opened_at"), str):
+                    p["opened_at"] = datetime.fromisoformat(p["opened_at"])
         except Exception as e:
-            print("load error:", e)
+            print("load error:", e, flush=True)
 
 
 ST   = State()
@@ -726,7 +742,7 @@ class H(BaseHTTPRequestHandler):
         if not tail:
             tail = ["لا توجد أحداث بعد"]
         body = {
-            "الإصدار": "0.6",
+            "الإصدار": CONFIG_VERSION,
             "الحالة": "ورقي" if PAPER_MODE else "تنفيذ حقيقي",
             "بوابة هيكن": {1: "LONG", -1: "SHORT", 0: "مقفولة"}.get(ST.gate("ha")),
             "بوابة الخام": {1: "LONG", -1: "SHORT", 0: "مقفولة"}.get(ST.gate("raw")),
@@ -779,7 +795,7 @@ if __name__ == "__main__":
     if "--report" in sys.argv:
         report(); sys.exit(0)
     print("═" * 55)
-    print(f"  وكيل محمود 0.6  |  {'📝 ورقي' if PAPER_MODE else '⚠️ تنفيذ حقيقي'}")
+    print(f"  وكيل محمود {CONFIG_VERSION}  |  {'📝 ورقي' if PAPER_MODE else '⚠️ تنفيذ حقيقي'}")
     print(f"  المنفذ {PORT}  |  المسار: /{SECRET}")
     print(f"  البيانات: {DATA_DIR}  {'💾 دائم' if DATA_DIR != BASE else '⚠️ مؤقت — تُمسح عند إعادة النشر'}")
     print(f"  إيقاف فوري: أنشئ ملف {KILL_FILE}")

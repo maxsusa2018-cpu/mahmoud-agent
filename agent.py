@@ -129,6 +129,10 @@ STATE_F   = os.path.join(DATA_DIR, "state.json")
 # كلمات البوابة المحايدة — تُقرأ فقط مع «القرار:» (النسخة المشدَّدة)
 NEUTRAL_KEYS = ("خروج سيولة", "راقب", "محايد")
 
+# قرارات مقيّدة — تُقرأ محايدة (منع دخول جديد) لا لونج عام:
+#   «LONG BTC فقط» = Alts ممنوعة | «تجنب Alts» | «Alts انتقائي» = بلا إذن عام
+RESTRICTED_KEYS = ("BTC فقط", "تجنب", "انتقائي")
+
 def classify(msg: str):
     """يحوّل نص التنبيه إلى (الدور، الاتجاه). الدور: gate/entry/exit_top/exit_bot/veto"""
     m = msg.replace("\u200f", "").strip()
@@ -144,6 +148,12 @@ def classify(msg: str):
         # المحايد يُفحص بعد LONG/SHORT عمداً كي لا يسبقهما
         if "القرار:" in m and any(k in m for k in NEUTRAL_KEYS):
             return (role, 0, "neutral_" + which)
+        # قرارات لا تحمل «Alts» أو تحملها بلا LONG/SHORT — كانت تسقط
+        # كـgate_bad_format فتبقى البوابة على قيمتها القديمة بصمت.
+        # تُقرأ محايدة: «LONG BTC فقط» تمنع Alts، والوكيل بلا مفهوم
+        # «بوابة مقيدة بعملة» — فالمنع أصدق من فتح لونج عام.
+        if "القرار:" in m and any(k in m for k in RESTRICTED_KEYS):
+            return (role, 0, "restricted_" + which)
         return (None, 0, "gate_bad_format")
 
     # ── بوابة قديمة بلا بادئة (نسخة Master ما قبل v15) — تُسجَّل ولا تُطبَّق
@@ -159,6 +169,13 @@ def classify(msg: str):
 
     # ── الفيتو
     if "BTC↓" in m and "BTC.D↓" in m:            return ("veto", 0, "liquidity_exit")
+
+    # ── الزناد الخام (Master v15) — شرطان لحظيان بلا انتظار BTC 1h
+    #    يُفحص قبل كتلة الدخول العامة: نصّه يحمل LONG/SHORT فيلتقطه
+    #    الفحص العام كـ«unknown» لو تُرك بعده. مصدر منفصل عمداً
+    #    كي يُقاس أداؤه ضد trigger_bot/trigger_top في الدفتر.
+    if "قاع خام" in m:                           return ("entry", +1, "raw_bottom")
+    if "قمة خام" in m:                           return ("entry", -1, "raw_top")
 
     # ── إشارات الدخول (المؤشرات الخمسة)
     up   = re.search(r"\b(LONG|BUY)\b", m, re.I) or "قاع جاهز" in m
@@ -179,7 +196,8 @@ def classify(msg: str):
 
 # وزن كل مصدر — يُستخدم للترتيب عند تزاحم الإشارات، لا للقرار
 WEIGHT = {"unified_confluence": 5, "unified_early": 4, "unified_classic": 4,
-          "wyckoff": 3, "wolfe": 3, "scanner_b": 2, "bb_rejection": 2}
+          "wyckoff": 3, "wolfe": 3, "raw_bottom": 3, "raw_top": 3,
+          "scanner_b": 2, "bb_rejection": 2}
 
 # الفريم المتوقع لكل دور — حماية من ربط الرابط بالنسخة الخطأ
 EXPECTED_TF = {"master_raw": {"240", "4h"}, "master_ha": {"240", "4h"},

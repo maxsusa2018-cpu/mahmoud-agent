@@ -78,7 +78,7 @@ LEVERAGE          = 25          # الرافعة
 TP_PCT            = 50.0        # هدف المرحلة 1 (25x → 50% = حركة 2%)
 SL_PCT            = 50.0        # الستوب الابتدائي (% من الهامش)
 
-CONFIG_VERSION    = "0.7"       # يُكتب مع كل حدث — لفصل عيّنة البوابتين عمّا قبلها
+CONFIG_VERSION    = "0.8"       # يُكتب مع كل حدث — لفصل عيّنة البوابتين عمّا قبلها
 
 MAX_DAILY_TRADES  = 5           # حد الصفقات اليومي (كان 3 — رُفع ليكفي بوابتين)
 MAX_OPEN          = 5           # 2 هيكن + 2 خام + 1 استكشاف
@@ -170,6 +170,12 @@ def classify(msg: str):
     # ── الفيتو
     if "BTC↓" in m and "BTC.D↓" in m:            return ("veto", 0, "liquidity_exit")
 
+    # ── حالة السوق (Master) — تُفحص أولاً: رسالة سياق لا إشارة دخول
+    if "MKT" in m and "BTC" in m:
+        if "RANGE" in m: return ("mkt",  0, "market_state")
+        if "DOWN"  in m: return ("mkt", -1, "market_state")
+        if "UP"    in m: return ("mkt", +1, "market_state")
+
     # ── الزناد الخام (Master v15) — شرطان لحظيان بلا انتظار BTC 1h
     #    يُفحص قبل كتلة الدخول العامة: نصّه يحمل LONG/SHORT فيلتقطه
     #    الفحص العام كـ«unknown» لو تُرك بعده. مصدر منفصل عمداً
@@ -240,6 +246,11 @@ class State:
         self.peak          = START_BALANCE
         self.halted        = False
         self.last_price    = {}     # ticker -> (price, ts)
+        # ── حالة سوق BTC وقت الإشارة (من تنبيه Master المستقل)
+        #    تُختم على كل قيد ظل — بها نعرف: هل الأداة تعمل أم السوق يجاملها؟
+        self.mkt           = "?"    # UP / DOWN / RANGE / ?
+        self.mkt_adx       = None
+        self.mkt_ts        = None
         self.load()
 
     # ── أسماء الحقول لكل بوابة (raw يحتفظ بالأسماء القديمة)
@@ -419,10 +430,11 @@ def try_entry(tk, d, src, price, now):
     log("shadow", {"ticker": tk, "dir": d, "src": src, "price": price,
                    "gate_ha": ST.gate("ha"), "gate_raw": ST.gate("raw"),
                    "executed": bool(which), "gate_source": which,
-                   "conflict": conflict, "reason": why})
+                   "conflict": conflict, "reason": why,
+                   "mkt": ST.mkt, "mkt_adx": ST.mkt_adx})
     if price:
         threading.Timer(SHADOW_FOLLOW_MIN * 60, shadow_follow,
-                        args=(tk, d, src, price, now.isoformat())).start()
+                        args=(tk, d, src, price, now.isoformat(), ST.mkt)).start()
 
     if which is None:
         # ⭐ المقعد الاستكشافي — نوع لم يظهر بين المفتوحات
@@ -480,14 +492,14 @@ def try_entry(tk, d, src, price, now):
                     args=(tk, d, src, price, which, conflict)).start()
 
 
-def shadow_follow(tk, d, src, ref_price, ref_ts):
+def shadow_follow(tk, d, src, ref_price, ref_ts, mkt="?"):
     """سعر ما بعد أربع ساعات — هو المقياس في قاعدة الحسم"""
     p = ST.last_price.get(tk, (None, None))[0]
     mv = None
     if p and ref_price:
         mv = round((p - ref_price) / ref_price * 100 * d, 3)
     log("shadow_result", {"ticker": tk, "src": src, "ref_ts": ref_ts,
-                          "ref_price": ref_price, "price_4h": p,
+                          "ref_price": ref_price, "price_4h": p, "mkt": mkt,
                           "move_pct": mv, "hit": (mv is not None and mv > 0)})
 
 def execute(tk, d, src, ref_price, which="raw", conflict=False):
@@ -695,6 +707,17 @@ def handle(msg):
     if exp and tf and tf not in exp:
         log("rejected", {**base, "reason": f"فريم خاطئ (المتوقع {exp})"}); return
 
+    # ── حالة السوق: تُخزَّن ولا تفتح صفقة
+    if role == "mkt":
+        import re as _re
+        a = _re.search(r"ADX\s*([0-9.]+)", msg)
+        with LOCK:
+            ST.mkt     = "UP" if d == 1 else "DOWN" if d == -1 else "RANGE"
+            ST.mkt_adx = float(a.group(1)) if a else None
+            ST.mkt_ts  = now.isoformat()
+            ST.save()
+        log("market_state", {**base, "mkt": ST.mkt, "adx": ST.mkt_adx}); return
+
     if px: on_price(tk, px, now)
 
     with LOCK:
@@ -761,6 +784,7 @@ class H(BaseHTTPRequestHandler):
             tail = ["لا توجد أحداث بعد"]
         body = {
             "الإصدار": CONFIG_VERSION,
+            "حالة السوق": f"{ST.mkt}" + (f" · ADX {ST.mkt_adx}" if ST.mkt_adx else ""),
             "الحالة": "ورقي" if PAPER_MODE else "تنفيذ حقيقي",
             "بوابة هيكن": {1: "LONG", -1: "SHORT", 0: "مقفولة"}.get(ST.gate("ha")),
             "بوابة الخام": {1: "LONG", -1: "SHORT", 0: "مقفولة"}.get(ST.gate("raw")),

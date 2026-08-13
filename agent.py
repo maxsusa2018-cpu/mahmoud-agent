@@ -3,12 +3,46 @@
 """
 ═══════════════════════════════════════════════════════════════
   وكيل محمود — Pionex Perpetual Futures
-  الإصدار 0.7 · 2 أغسطس 2026 · وضع ورقي (لا تنفيذ حقيقي)
+  الإصدار 0.8-c · 13 أغسطس 2026 · وضع ورقي (لا تنفيذ حقيقي)
 ═══════════════════════════════════════════════════════════════
 
   المبدأ: المؤشرات حسّاسات تبلّغ فقط. هذا الملف هو العقل الوحيد.
   أربعة منها عمياء عن السوق — فالفيتو هنا مركزياً لا داخل السكربتات.
 
+  ─────────────────────────────────────────────────────────────
+  تغيير 0.8-c (13 أغسطس) — إصلاح · لا تعديل منطق قرار
+  ─────────────────────────────────────────────────────────────
+  🔴 (1) الصفقة الشبح — العطل الأخطر منذ بدء الاختبار.
+         close_position كان يشيل الصفقة عند portion >= 1.0 فقط.
+         لكن كل إغلاق بعد المرحلة الأولى نصفٌ (0.5):
+           · الستوب على breakeven → 0.5
+           · exit_signal          → 0.5
+         فالصفقة تُغلق محاسبياً وتبقى في القائمة للأبد.
+         النتيجة: المقاعد تمتلئ بموتى، وكل إشارة جديدة تُرفض
+         slots_full، و«صفقات اليوم» تبقى صفراً بلا سبب ظاهر.
+         مثبت بالمحاكاة على نسخة حرفية من الدالة.
+         الإصلاح: تُزال أيضاً متى أُغلق النصف الثاني (half=True).
+
+  🟡 (2) الفاصلة العائمة تُسقط الهدف عند الحد بالضبط:
+         حركة 2% × 25x تعطي 49.9999999999997 وهي < 50 فلا يُنفَّذ.
+         الإصلاح: هامش 1e-9.
+
+  🟢 (3) سجل CLOSE أُثري: entry · side · src · gate_source ·
+         conflict · مدة الصفقة · half. بدون gate_source لا يمكن
+         حسم قاعدة البوابتين المسبقة يوم 21 أغسطس.
+
+  🟢 (4) مصالحة المراكز عند الإقلاع: يُقرأ الدفتر، وأي مركز
+         تثبت أسطرُه أن مجموع إغلاقاته ≥ 1.0 يُزال. يعالج
+         الأشباح المتراكمة قبل هذا الإصدار — من بيانات حقيقية
+         لا من تخمين.
+
+  ⚠️ CONFIG_VERSION رُفع إلى 0.8-c عمداً: سلوك المقاعد تغيّر
+     جوهرياً، فخلط ما قبل بما بعد يفسد التحليل. عيّنة 0.8-b
+     تُقرأ منفصلة.
+
+  ─────────────────────────────────────────────────────────────
+  ما قبل ذلك (سجل التغييرات الأصلي)
+  ─────────────────────────────────────────────────────────────
   تغيير 0.2:  «إجمالي الأحداث» كان يعدّ أسطر العرض (25 كحد أقصى)
               لا الأحداث الفعلية — والآن يعدّ كل سطر في الدفتر.
 
@@ -77,8 +111,9 @@ MARGIN_USD        = 1.0         # هامش الصفقة الواحدة
 LEVERAGE          = 25          # الرافعة
 TP_PCT            = 50.0        # هدف المرحلة 1 (25x → 50% = حركة 2%)
 SL_PCT            = 50.0        # الستوب الابتدائي (% من الهامش)
+EPS               = 1e-9        # هامش الفاصلة العائمة عند مقارنة الهدف
 
-CONFIG_VERSION    = "0.8"       # يُكتب مع كل حدث — لفصل عيّنة البوابتين عمّا قبلها
+CONFIG_VERSION    = "0.8-c"     # يُكتب مع كل حدث — سلوك المقاعد تغيّر، فالعيّنة تُفصل
 
 MAX_DAILY_TRADES  = 5           # حد الصفقات اليومي (كان 3 — رُفع ليكفي بوابتين)
 MAX_OPEN          = 5           # 2 هيكن + 2 خام + 1 استكشاف
@@ -350,6 +385,48 @@ class State:
 ST   = State()
 LOCK = threading.Lock()
 
+
+# ═══════════════════════════════════════════════════════════════
+#  🔧 0.8-c — مصالحة المراكز عند الإقلاع
+#     يعالج الأشباح المتراكمة قبل هذا الإصدار: أي مركز يثبت الدفتر
+#     أن مجموع إغلاقاته ≥ 1.0 يُزال. من بيانات حقيقية لا من تخمين.
+# ═══════════════════════════════════════════════════════════════
+
+def reconcile_positions():
+    if not ST.positions or not os.path.exists(LEDGER):
+        return
+    closed = {}          # ticker -> مجموع الأجزاء المغلقة بعد آخر فتح
+    try:
+        with open(LEDGER) as f:
+            for line in f:
+                if '"CLOSE"' not in line and '"OPEN"' not in line:
+                    continue
+                try:
+                    r = json.loads(line)
+                except Exception:
+                    continue
+                tk = r.get("ticker")
+                if not tk:
+                    continue
+                if r.get("kind") == "OPEN":
+                    closed[tk] = 0.0                      # فتح جديد يصفّر العدّاد
+                elif r.get("kind") == "CLOSE":
+                    closed[tk] = closed.get(tk, 0.0) + float(r.get("portion") or 0)
+    except Exception as e:
+        print("reconcile read error:", e, flush=True)
+        return
+
+    ghosts = [tk for tk in list(ST.positions) if closed.get(tk, 0.0) >= 1.0 - EPS]
+    for tk in ghosts:
+        ST.positions.pop(tk, None)
+        log("reconcile_removed", {"ticker": tk, "closed_portion": closed.get(tk),
+                                  "note": "أُغلقت بالكامل في الدفتر وبقيت شبحاً — أُزيلت"})
+    if ghosts:
+        ST.save()
+        log("reconcile_done", {"removed": len(ghosts), "ghosts": ghosts,
+                               "remaining": list(ST.positions)})
+
+
 # ═══════════════════════════════════════════════════════════════
 #  الفيتوات
 # ═══════════════════════════════════════════════════════════════
@@ -466,7 +543,8 @@ def try_entry(tk, d, src, price, now):
             oa  = pos.get("opened_at")
             gap = None
             try:
-                gap = round((now - datetime.fromisoformat(oa)).total_seconds() / 60, 1)
+                oa_dt = oa if isinstance(oa, datetime) else datetime.fromisoformat(oa)
+                gap = round((now - oa_dt).total_seconds() / 60, 1)
             except Exception:
                 pass
             delta = None; verdict = "?"
@@ -589,11 +667,38 @@ def close_position(tk, portion, reason, price):
     BROKER.close(tk, pos["side"], price, portion)
     ST.balance += MARGIN_USD * pl / 100
     ST.peak = max(ST.peak, ST.balance)
+
+    # ── مدة الصفقة بالدقائق (للتحليل النهائي)
+    dur = None
+    try:
+        oa = pos.get("opened_at")
+        oa_dt = oa if isinstance(oa, datetime) else datetime.fromisoformat(oa)
+        dur = round((now_utc() - oa_dt).total_seconds() / 60, 1)
+    except Exception:
+        pass
+
+    # ── 0.8-c: سجل مُثرى — بدون gate_source لا يمكن حسم قاعدة البوابتين
     log("CLOSE", {"ticker": tk, "portion": portion, "reason": reason,
                   "price": price, "pnl_pct": round(pl, 1),
-                  "balance": round(ST.balance, 3)})
-    if portion >= 1.0:
+                  "balance": round(ST.balance, 3),
+                  "entry": pos.get("entry"),
+                  "side": "LONG" if pos.get("side", 0) > 0 else "SHORT",
+                  "src": pos.get("src"),
+                  "gate_source": pos.get("gate_source"),
+                  "conflict": pos.get("conflict"),
+                  "was_half": bool(pos.get("half")),
+                  "duration_min": dur,
+                  "mkt": ST.mkt})
+
+    # ── 🔴 الإصلاح الجوهري 0.8-c
+    #    كان: if portion >= 1.0 — فالنصف الثاني يُغلق محاسبياً
+    #    وتبقى الصفقة في القائمة للأبد، فتمتلئ المقاعد بموتى.
+    #    الآن: النصف الثاني (half=True) يُزيلها أيضاً.
+    if portion >= 1.0 - EPS or pos.get("half"):
         ST.positions.pop(tk, None)
+        log("position_removed", {"ticker": tk, "reason": reason,
+                                 "slots": {w: slots_used(w) for w in ("ha", "raw", "explore")}})
+
     # حد التراجع
     if ST.peak > 0 and (ST.peak - ST.balance) / ST.peak * 100 >= MAX_DRAWDOWN_PCT:
         ST.halted = True
@@ -615,7 +720,8 @@ def on_price(tk, price, now):
         return
 
     # ── المرحلة 1+2: بلوغ الهدف = أغلق النصف وانقل الستوب لنقطة الدخول
-    if not pos["half"] and pnl_pct(pos, price) >= TP_PCT:
+    #    0.8-c: هامش EPS — حركة 2% × 25x تعطي 49.9999999999997 فتسقط بلا سببه
+    if not pos["half"] and pnl_pct(pos, price) >= TP_PCT - EPS:
         close_position(tk, 0.5, "TP_half", price)
         if tk in ST.positions:
             ST.positions[tk]["half"] = True
@@ -766,7 +872,19 @@ class H(BaseHTTPRequestHandler):
             handle(body)
         except Exception as e:
             log("error", {"exc": str(e), "body": body[:200]})
+
+    def _send_json(self, obj):
+        out = json.dumps(obj, ensure_ascii=False, indent=1).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(out)))
+        self.end_headers(); self.wfile.write(out)
+
     def do_GET(self):
+        # ── 0.8-c: مسار الصفقات المكتملة — للحكم يوم 21 أغسطس
+        if SECRET and self.path.startswith("/trades") and SECRET in self.path:
+            self._send_json(trades_summary()); return
+
         # ── إجمالي الأحداث = كل أسطر الدفتر، لا الـ25 المعروضة فقط
         tail = []; total = 0
         try:
@@ -797,12 +915,55 @@ class H(BaseHTTPRequestHandler):
             "الطابور": len(QUEUE),
             "آخر الأحداث": tail[::-1],
         }
-        out = json.dumps(body, ensure_ascii=False, indent=1).encode()
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(out)))
-        self.end_headers(); self.wfile.write(out)
+        self._send_json(body)
     def log_message(self, *a): pass
+
+
+# ═══════════════════════════════════════════════════════════════
+#  ملخّص الصفقات — 0.8-c · للحكم النهائي
+# ═══════════════════════════════════════════════════════════════
+
+def trades_summary():
+    """يجمع كل CLOSE من الدفتر ويقسّمها حسب البوابة والمصدر والنتيجة."""
+    if not os.path.exists(LEDGER):
+        return {"error": "لا يوجد دفتر"}
+    rows = []
+    with open(LEDGER) as f:
+        for line in f:
+            if '"CLOSE"' not in line:
+                continue
+            try:
+                r = json.loads(line)
+            except Exception:
+                continue
+            if r.get("kind") == "CLOSE":
+                rows.append(r)
+
+    def bucket(key_fn):
+        out = {}
+        for r in rows:
+            k = key_fn(r) or "?"
+            b = out.setdefault(k, {"عدد": 0, "رابحة": 0, "خاسرة": 0, "مجموع%": 0.0})
+            p = float(r.get("pnl_pct") or 0)
+            b["عدد"] += 1
+            b["رابحة" if p > 0 else "خاسرة"] += 1
+            b["مجموع%"] = round(b["مجموع%"] + p, 1)
+        for b in out.values():
+            b["نسبة الربح%"] = round(b["رابحة"] / b["عدد"] * 100, 1) if b["عدد"] else 0
+            b["متوسط%"] = round(b["مجموع%"] / b["عدد"], 1) if b["عدد"] else 0
+        return out
+
+    wins = sum(1 for r in rows if float(r.get("pnl_pct") or 0) > 0)
+    return {
+        "إجمالي الإغلاقات": len(rows),
+        "رابحة": wins, "خاسرة": len(rows) - wins,
+        "نسبة الربح%": round(wins / len(rows) * 100, 1) if rows else 0,
+        "حسب البوابة": bucket(lambda r: r.get("gate_source")),
+        "حسب المصدر": bucket(lambda r: r.get("src")),
+        "حسب السبب": bucket(lambda r: r.get("reason")),
+        "حسب الإصدار": bucket(lambda r: r.get("cfg")),
+        "الرصيد الحالي": round(ST.balance, 3),
+    }
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -842,4 +1003,5 @@ if __name__ == "__main__":
     print(f"  البيانات: {DATA_DIR}  {'💾 دائم' if DATA_DIR != BASE else '⚠️ مؤقت — تُمسح عند إعادة النشر'}")
     print(f"  إيقاف فوري: أنشئ ملف {KILL_FILE}")
     print("═" * 55)
+    reconcile_positions()          # 0.8-c — تنظيف الأشباح من بيانات الدفتر
     HTTPServer(("0.0.0.0", PORT), H).serve_forever()

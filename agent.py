@@ -3,11 +3,38 @@
 """
 ═══════════════════════════════════════════════════════════════
   وكيل محمود — Pionex Perpetual Futures
-  الإصدار 0.8-d · 13 أغسطس 2026 · وضع ورقي (لا تنفيذ حقيقي)
+  الإصدار 0.8-e · 14 أغسطس 2026 · وضع ورقي (لا تنفيذ حقيقي)
 ═══════════════════════════════════════════════════════════════
 
   المبدأ: المؤشرات حسّاسات تبلّغ فقط. هذا الملف هو العقل الوحيد.
   أربعة منها عمياء عن السوق — فالفيتو هنا مركزياً لا داخل السكربتات.
+
+  ─────────────────────────────────────────────────────────────
+  تغيير 0.8-e (14 أغسطس) — إصلاح دفتر الظل · لا تعديل منطق قرار
+  ─────────────────────────────────────────────────────────────
+  🔴 (1) متابعة الظل كانت تموت مع كل إعادة نشر.
+         threading.Timer بأربع ساعات يعيش في الذاكرة وحدها، وأي
+         نشر جديد أو إعادة تشغيل من الاستضافة يمسح كل المؤقتات
+         المعلّقة. الوكيل نُشر مرات عديدة خلال أسبوعين، فجزء
+         كبير من دفتر الظل ضاع بلا أثر — ولهذا لم يُنتج حكماً
+         رغم آلاف الأحداث.
+         الإصلاح: طابور على القرص الدائم + عامل يفحصه كل دقيقة.
+
+  🔴 (2) سعر المتابعة كان يُقرأ من ST.last_price — أي من آخر
+         تنبيه وصل لتلك العملة. فإن لم يصل تنبيه خلال الأربع
+         ساعات، price_4h = None والقيد بلا نتيجة.
+         الإصلاح: يُجلب مستقلاً من بينانس، كما يفعل وكيل التسجيل.
+
+  🟢 (3) كل قيد ظل صار يحمل executed و reason و حالتي البوابتين.
+         بهذا يصير السؤال الذي لم يُطرح قط قابلاً للإجابة:
+         «الإشارات التي منعتها البوابة — كم منها كان سيربح؟»
+
+  🟢 (4) مساران جديدان:
+         /blocked/SECRET  — ملخّص الممنوع مقابل المنفَّذ
+         /ledger/SECRET   — تصدير الدفتر الخام (?kind=... للفلترة)
+
+  ⚠️ القيود المسجّلة قبل هذا الإصدار بلا executed/reason فتظهر
+     تحت "?" — العدّ الحقيقي يبدأ من الآن.
 
   ─────────────────────────────────────────────────────────────
   تغيير 0.8-d (13 أغسطس) — إصلاح محاسبي · لا تعديل منطق قرار
@@ -106,6 +133,7 @@
 """
 
 import json, os, re, sys, threading, time
+import urllib.request
 # طباعة فورية — بلا هذا لا تظهر السطور في سجل الاستضافة
 try:
     sys.stdout.reconfigure(line_buffering=True)
@@ -128,7 +156,7 @@ TP_PCT            = 50.0        # هدف المرحلة 1 (25x → 50% = حرك�
 SL_PCT            = 50.0        # الستوب الابتدائي (% من الهامش)
 EPS               = 1e-9        # هامش الفاصلة العائمة عند مقارنة الهدف
 
-CONFIG_VERSION    = "0.8-d"     # يُكتب مع كل حدث — سلوك المقاعد تغيّر، فالعيّنة تُفصل
+CONFIG_VERSION    = "0.8-e"     # يُكتب مع كل حدث — دفتر الظل تغيّر، فالعيّنة تُفصل
 
 MAX_DAILY_TRADES  = 5           # حد الصفقات اليومي (كان 3 — رُفع ليكفي بوابتين)
 MAX_OPEN          = 5           # 2 هيكن + 2 خام + 1 استكشاف
@@ -171,6 +199,7 @@ except Exception as e:
 KILL_FILE = os.path.join(DATA_DIR, "KILL")
 LEDGER    = os.path.join(DATA_DIR, "ledger.jsonl")   # دفتر الظل — كل شيء
 STATE_F   = os.path.join(DATA_DIR, "state.json")
+SHADOW_F  = os.path.join(DATA_DIR, "shadow_pending.jsonl")  # 0.8-e — طابور المتابعة
 
 # ═══════════════════════════════════════════════════════════════
 #  قاموس الإشارات — يطابق نصوص تنبيهاتك الفعلية
@@ -493,6 +522,82 @@ BROKER = PaperBroker()
 
 
 # ═══════════════════════════════════════════════════════════════
+#  0.8-e — متابعة الظل تنجو من إعادة النشر
+#
+#  العطل السابق: threading.Timer بأربع ساعات يعيش في الذاكرة وحدها.
+#  أي نشر جديد يمسح كل المؤقتات المعلّقة فتضيع نتائجها نهائياً.
+#  وسعر المتابعة كان يُقرأ من آخر تنبيه وصل — فإن لم يصل تنبيه
+#  خلال الأربع ساعات فالنتيجة None.
+#
+#  الإصلاح: طابور على القرص الدائم + عامل يفحصه كل دقيقة +
+#  سعر مستقل من بينانس، كما يفعل وكيل التسجيل.
+# ═══════════════════════════════════════════════════════════════
+
+def binance_price(tk):
+    """سعر مستقل من بينانس — لا يعتمد على وصول تنبيه"""
+    s = tk.replace("BINANCE:", "").replace(".P", "").upper()
+    try:
+        u = f"https://api.binance.com/api/v3/ticker/price?symbol={s}"
+        with urllib.request.urlopen(u, timeout=10) as r:
+            return float(json.load(r)["price"])
+    except Exception as e:
+        log("shadow_price_error", {"ticker": tk, "err": str(e)[:80]})
+        return None
+
+def shadow_queue(tk, d, src, ref_price, ref_ts, mkt,
+                 executed=False, reason=None, gh=0, gr=0):
+    """يحفظ قيد المتابعة على القرص بدل مؤقّت في الذاكرة"""
+    rec = {"tk": tk, "dir": d, "src": src, "ref_price": ref_price,
+           "ref_ts": ref_ts, "mkt": mkt, "executed": executed,
+           "reason": reason, "gate_ha": gh, "gate_raw": gr,
+           "due": (now_utc() + timedelta(minutes=SHADOW_FOLLOW_MIN)).isoformat()}
+    try:
+        with open(SHADOW_F, "a") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception as e:
+        print("shadow queue error:", e, flush=True)
+
+def shadow_worker():
+    """يفحص الطابور كل دقيقة — ينجو من إعادة التشغيل لأن الطابور على القرص"""
+    while True:
+        try:
+            if os.path.exists(SHADOW_F):
+                now = now_utc(); keep = []
+                rows = []
+                with open(SHADOW_F) as f:
+                    for l in f:
+                        if not l.strip(): continue
+                        try: rows.append(json.loads(l))
+                        except Exception: pass
+                for r in rows:
+                    try:
+                        due = datetime.fromisoformat(r["due"])
+                    except Exception:
+                        continue
+                    if due > now:
+                        keep.append(r); continue
+                    p  = binance_price(r["tk"])
+                    rp = r.get("ref_price")
+                    mv = round((p - rp) / rp * 100 * r["dir"], 3) if (p and rp) else None
+                    log("shadow_result", {
+                        "ticker": r["tk"], "src": r["src"], "dir": r["dir"],
+                        "ref_ts": r["ref_ts"], "ref_price": rp, "price_4h": p,
+                        "mkt": r.get("mkt"), "move_pct": mv,
+                        "hit": (mv is not None and mv > 0),
+                        "executed": r.get("executed"), "reason": r.get("reason"),
+                        "gate_ha": r.get("gate_ha"), "gate_raw": r.get("gate_raw"),
+                        "via": "binance"})
+                tmp = SHADOW_F + ".tmp"
+                with open(tmp, "w") as f:
+                    for r in keep:
+                        f.write(json.dumps(r, ensure_ascii=False) + "\n")
+                os.replace(tmp, SHADOW_F)
+        except Exception as e:
+            print("shadow worker error:", e, flush=True)
+        time.sleep(60)
+
+
+# ═══════════════════════════════════════════════════════════════
 #  الدخول
 # ═══════════════════════════════════════════════════════════════
 
@@ -525,8 +630,12 @@ def try_entry(tk, d, src, price, now):
                    "conflict": conflict, "reason": why,
                    "mkt": ST.mkt, "mkt_adx": ST.mkt_adx})
     if price:
-        threading.Timer(SHADOW_FOLLOW_MIN * 60, shadow_follow,
-                        args=(tk, d, src, price, now.isoformat(), ST.mkt)).start()
+        # 0.8-e: طابور على القرص بدل مؤقّت يموت مع إعادة النشر.
+        # executed/reason يُحفظان مع القيد — بهما يُجاب سؤال
+        # «الإشارات التي منعتها البوابة كم منها كان سيربح؟»
+        shadow_queue(tk, d, src, price, now.isoformat(), ST.mkt,
+                     executed=bool(which), reason=why,
+                     gh=ST.gate("ha"), gr=ST.gate("raw"))
 
     if which is None:
         # ⭐ المقعد الاستكشافي — نوع لم يظهر بين المفتوحات
@@ -586,14 +695,18 @@ def try_entry(tk, d, src, price, now):
 
 
 def shadow_follow(tk, d, src, ref_price, ref_ts, mkt="?"):
-    """سعر ما بعد أربع ساعات — هو المقياس في قاعدة الحسم"""
+    """
+    النسخة القديمة — محفوظة كي لا ينكسر أي مؤقّت ما زال معلّقاً
+    من تشغيل سابق. لم تعد تُستدعى في المسار الجديد.
+    """
     p = ST.last_price.get(tk, (None, None))[0]
     mv = None
     if p and ref_price:
         mv = round((p - ref_price) / ref_price * 100 * d, 3)
     log("shadow_result", {"ticker": tk, "src": src, "ref_ts": ref_ts,
                           "ref_price": ref_price, "price_4h": p, "mkt": mkt,
-                          "move_pct": mv, "hit": (mv is not None and mv > 0)})
+                          "move_pct": mv, "hit": (mv is not None and mv > 0),
+                          "via": "legacy_timer"})
 
 def execute(tk, d, src, ref_price, which="raw", conflict=False):
     with LOCK:
@@ -915,6 +1028,30 @@ class H(BaseHTTPRequestHandler):
         if SECRET and self.path.startswith("/trades") and SECRET in self.path:
             self._send_json(trades_summary()); return
 
+        # ── 0.8-e: ملخّص الممنوع — كم من الإشارات التي منعتها البوابة كان سيربح
+        if SECRET and self.path.startswith("/blocked") and SECRET in self.path:
+            self._send_json(blocked_summary()); return
+
+        # ── 0.8-e: تصدير دفتر الظل الخام
+        #    /ledger/SECRET                      = آخر 3000 سطر
+        #    /ledger/SECRET?kind=shadow_result   = نوع واحد فقط
+        if SECRET and self.path.startswith("/ledger") and SECRET in self.path:
+            kinds = None
+            m = re.search(r"kind=([A-Za-z_,]+)", self.path)
+            if m: kinds = set(m.group(1).split(","))
+            out = []
+            try:
+                with open(LEDGER) as f:
+                    for l in f:
+                        if not l.strip(): continue
+                        try: r = json.loads(l)
+                        except Exception: continue
+                        if kinds and r.get("kind") not in kinds: continue
+                        out.append(r)
+            except Exception as e:
+                out = [{"error": str(e)}]
+            self._send_json(out[-3000:]); return
+
         # ── إجمالي الأحداث = كل أسطر الدفتر، لا الـ25 المعروضة فقط
         tail = []; total = 0
         try:
@@ -930,6 +1067,13 @@ class H(BaseHTTPRequestHandler):
             pass
         if not tail:
             tail = ["لا توجد أحداث بعد"]
+        pend = 0
+        try:
+            if os.path.exists(SHADOW_F):
+                with open(SHADOW_F) as f:
+                    pend = sum(1 for l in f if l.strip())
+        except Exception:
+            pass
         body = {
             "الإصدار": CONFIG_VERSION,
             "حالة السوق": f"{ST.mkt}" + (f" · ADX {ST.mkt_adx}" if ST.mkt_adx else ""),
@@ -943,6 +1087,7 @@ class H(BaseHTTPRequestHandler):
             "متوقف": ST.halted, "إجمالي الأحداث": total,
             "التخزين": "💾 دائم" if DATA_DIR != BASE else "⚠️ مؤقت",
             "الطابور": len(QUEUE),
+            "ظل ينتظر المتابعة": pend,
             "آخر الأحداث": tail[::-1],
         }
         self._send_json(body)
@@ -997,6 +1142,66 @@ def trades_summary():
 
 
 # ═══════════════════════════════════════════════════════════════
+#  ملخّص الممنوع — 0.8-e
+#  السؤال الذي لم يُطرح قط: الإشارات التي منعتها البوابة،
+#  كم منها كان سيربح؟ هذا نصف معيار الاستبعاد (التعطيل).
+# ═══════════════════════════════════════════════════════════════
+
+def blocked_summary():
+    if not os.path.exists(LEDGER):
+        return {"error": "لا يوجد دفتر"}
+    rows = []
+    with open(LEDGER) as f:
+        for line in f:
+            if '"shadow_result"' not in line:
+                continue
+            try:
+                r = json.loads(line)
+            except Exception:
+                continue
+            if r.get("kind") == "shadow_result" and r.get("move_pct") is not None:
+                rows.append(r)
+
+    def bucket(key_fn):
+        out = {}
+        for r in rows:
+            k = key_fn(r)
+            if k is None:
+                continue
+            b = out.setdefault(str(k), {"عدد": 0, "صدقت": 0, "مجموع%": 0.0})
+            b["عدد"] += 1
+            if r.get("hit"):
+                b["صدقت"] += 1
+            b["مجموع%"] = round(b["مجموع%"] + float(r["move_pct"]), 1)
+        for b in out.values():
+            b["نسبة الصدق%"] = round(b["صدقت"] / b["عدد"] * 100, 1) if b["عدد"] else 0
+            b["متوسط%"] = round(b["مجموع%"] / b["عدد"], 3) if b["عدد"] else 0
+        return out
+
+    def agg(lst):
+        if not lst:
+            return {"عدد": 0}
+        h = sum(1 for r in lst if r.get("hit"))
+        s = sum(float(r["move_pct"]) for r in lst)
+        return {"عدد": len(lst), "صدقت": h,
+                "نسبة الصدق%": round(h / len(lst) * 100, 1),
+                "متوسط%": round(s / len(lst), 3)}
+
+    blocked = [r for r in rows if r.get("executed") is False]
+    done    = [r for r in rows if r.get("executed") is True]
+    return {
+        "قيود لها نتيجة": len(rows),
+        "الممنوعة": agg(blocked),
+        "المنفَّذة": agg(done),
+        "الممنوعة حسب السبب": bucket(
+            lambda r: r.get("reason") if r.get("executed") is False else None),
+        "حسب المصدر": bucket(lambda r: r.get("src") or "?"),
+        "حسب حالة السوق": bucket(lambda r: r.get("mkt") or "?"),
+        "ملاحظة": "القيود قبل 0.8-e بلا executed/reason — لا تدخل التقسيم",
+    }
+
+
+# ═══════════════════════════════════════════════════════════════
 #  التقرير اليومي
 # ═══════════════════════════════════════════════════════════════
 
@@ -1034,4 +1239,6 @@ if __name__ == "__main__":
     print(f"  إيقاف فوري: أنشئ ملف {KILL_FILE}")
     print("═" * 55)
     reconcile_positions()          # 0.8-c — تنظيف الأشباح من بيانات الدفتر
+    threading.Thread(target=shadow_worker, daemon=True).start()
+    print("🔄 عامل متابعة الظل بدأ — طابور على القرص، سعر من بينانس", flush=True)
     HTTPServer(("0.0.0.0", PORT), H).serve_forever()

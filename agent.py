@@ -3,11 +3,26 @@
 """
 ═══════════════════════════════════════════════════════════════
   وكيل محمود — Pionex Perpetual Futures
-  الإصدار 0.8-c · 13 أغسطس 2026 · وضع ورقي (لا تنفيذ حقيقي)
+  الإصدار 0.8-d · 13 أغسطس 2026 · وضع ورقي (لا تنفيذ حقيقي)
 ═══════════════════════════════════════════════════════════════
 
   المبدأ: المؤشرات حسّاسات تبلّغ فقط. هذا الملف هو العقل الوحيد.
   أربعة منها عمياء عن السوق — فالفيتو هنا مركزياً لا داخل السكربتات.
+
+  ─────────────────────────────────────────────────────────────
+  تغيير 0.8-d (13 أغسطس) — إصلاح محاسبي · لا تعديل منطق قرار
+  ─────────────────────────────────────────────────────────────
+  🔴 سعر التنفيذ كان يُؤخذ من السعر الواصل مع التنبيه، لا من
+     سعر الستوب/الهدف. والوكيل لا يرى السعر إلا لحظة وصول
+     تنبيه — فقد يصل سعرٌ أبعد بكثير من الستوب. النتيجة:
+       · breakeven_stop: 90 خسارة من 90، متوسط −26.1%
+         والستوب على نقطة الدخول بالضبط ⇒ الصحيح 0.0%
+       · stop_loss: −68.8% والستوب مضبوط على −50%
+       · TP_half:   +33.1% للنصف والصحيح +25%
+     صافي التشويه ≈ −23.8$ — الرصيد الحقيقي ≈ 97$ لا 73$.
+     الإصلاح: الستوب يُنفَّذ عند pos["sl"]، والهدف عند tp_price().
+     السعر الواصل يُحفظ في feed_price + feed_gap_pct للشفافية.
+  ⚠️ الإغلاقات السابقة تبقى كما سُجّلت — «حسب الإصدار» يفصلها.
 
   ─────────────────────────────────────────────────────────────
   تغيير 0.8-c (13 أغسطس) — إصلاح · لا تعديل منطق قرار
@@ -113,7 +128,7 @@ TP_PCT            = 50.0        # هدف المرحلة 1 (25x → 50% = حرك�
 SL_PCT            = 50.0        # الستوب الابتدائي (% من الهامش)
 EPS               = 1e-9        # هامش الفاصلة العائمة عند مقارنة الهدف
 
-CONFIG_VERSION    = "0.8-c"     # يُكتب مع كل حدث — سلوك المقاعد تغيّر، فالعيّنة تُفصل
+CONFIG_VERSION    = "0.8-d"     # يُكتب مع كل حدث — سلوك المقاعد تغيّر، فالعيّنة تُفصل
 
 MAX_DAILY_TRADES  = 5           # حد الصفقات اليومي (كان 3 — رُفع ليكفي بوابتين)
 MAX_OPEN          = 5           # 2 هيكن + 2 خام + 1 استكشاف
@@ -660,7 +675,11 @@ def pnl_pct(pos, price):
     """الربح كنسبة من الهامش (مع الرافعة)"""
     return (price - pos["entry"]) / pos["entry"] * 100 * LEVERAGE * pos["side"]
 
-def close_position(tk, portion, reason, price):
+def tp_price(pos):
+    """السعر الذي يتحقق عنده الهدف بالضبط — أمر محدَّد يُنفَّذ عنده لا فوقه"""
+    return pos["entry"] * (1 + pos["side"] * TP_PCT / (100.0 * LEVERAGE))
+
+def close_position(tk, portion, reason, price, feed_price=None):
     pos = ST.positions.get(tk)
     if not pos: return
     pl = pnl_pct(pos, price) * portion
@@ -678,8 +697,12 @@ def close_position(tk, portion, reason, price):
         pass
 
     # ── 0.8-c: سجل مُثرى — بدون gate_source لا يمكن حسم قاعدة البوابتين
+    #    0.8-d: price = سعر التنفيذ الفعلي (الستوب/الهدف)، feed_price = السعر الواصل
     log("CLOSE", {"ticker": tk, "portion": portion, "reason": reason,
-                  "price": price, "pnl_pct": round(pl, 1),
+                  "price": price, "feed_price": feed_price,
+                  "feed_gap_pct": (round((feed_price - price) / price * 100, 3)
+                                   if feed_price and price else None),
+                  "pnl_pct": round(pl, 1),
                   "balance": round(ST.balance, 3),
                   "entry": pos.get("entry"),
                   "side": "LONG" if pos.get("side", 0) > 0 else "SHORT",
@@ -714,15 +737,22 @@ def on_price(tk, price, now):
     pos["peak"] = max(pos["peak"], price) if d > 0 else min(pos["peak"], price)
 
     # ── الستوب أولاً دائماً
+    #    🔴 0.8-d: يُنفَّذ عند سعر الستوب لا عند السعر الواصل.
+    #    الوكيل يستقبل الأسعار مع التنبيهات فقط، فقد يصل سعر أبعد
+    #    بكثير من الستوب. حسابه كسعر تنفيذ يخترع خسارة لم تقع:
+    #    breakeven_stop سجّل 90 خسارة من 90 بمتوسط −26% —
+    #    وستوبه على نقطة الدخول بالضبط، أي أن الصحيح صفر.
     if (d > 0 and price <= pos["sl"]) or (d < 0 and price >= pos["sl"]):
         close_position(tk, 1.0 if not pos["half"] else 0.5,
-                       "breakeven_stop" if pos["half"] else "stop_loss", price)
+                       "breakeven_stop" if pos["half"] else "stop_loss",
+                       pos["sl"], feed_price=price)
         return
 
     # ── المرحلة 1+2: بلوغ الهدف = أغلق النصف وانقل الستوب لنقطة الدخول
     #    0.8-c: هامش EPS — حركة 2% × 25x تعطي 49.9999999999997 فتسقط بلا سببه
+    #    0.8-d: التنفيذ عند سعر الهدف — الأمر المحدَّد يُملأ عنده لا فوقه
     if not pos["half"] and pnl_pct(pos, price) >= TP_PCT - EPS:
-        close_position(tk, 0.5, "TP_half", price)
+        close_position(tk, 0.5, "TP_half", tp_price(pos), feed_price=price)
         if tk in ST.positions:
             ST.positions[tk]["half"] = True
             ST.positions[tk]["sl"]   = pos["entry"]        # ← breakeven

@@ -156,7 +156,7 @@ TP_PCT            = 50.0        # هدف المرحلة 1 (25x → 50% = حرك�
 SL_PCT            = 50.0        # الستوب الابتدائي (% من الهامش)
 EPS               = 1e-9        # هامش الفاصلة العائمة عند مقارنة الهدف
 
-CONFIG_VERSION    = "0.8-e"     # يُكتب مع كل حدث — دفتر الظل تغيّر، فالعيّنة تُفصل
+CONFIG_VERSION    = "0.8-f"     # يُكتب مع كل حدث — دفتر الظل تغيّر، فالعيّنة تُفصل
 
 MAX_DAILY_TRADES  = 5           # حد الصفقات اليومي (كان 3 — رُفع ليكفي بوابتين)
 MAX_OPEN          = 5           # 2 هيكن + 2 خام + 1 استكشاف
@@ -534,15 +534,35 @@ BROKER = PaperBroker()
 # ═══════════════════════════════════════════════════════════════
 
 def binance_price(tk):
-    """سعر مستقل من بينانس — لا يعتمد على وصول تنبيه"""
-    s = tk.replace("BINANCE:", "").replace(".P", "").upper()
-    try:
-        u = f"https://api.binance.com/api/v3/ticker/price?symbol={s}"
-        with urllib.request.urlopen(u, timeout=10) as r:
-            return float(json.load(r)["price"])
-    except Exception as e:
-        log("shadow_price_error", {"ticker": tk, "err": str(e)[:80]})
-        return None
+    """
+    سعر مستقل من بينانس — لا يعتمد على وصول تنبيه.
+
+    إصلاح ١٤ أغسطس (0.8-f):
+      النسخة السابقة أزالت البادئة "BINANCE:" حرفياً فقط، فرمز مثل
+      PIONEX:ADAUSDT.P صار PIONEX:ADAUSDT وبينانس ترفضه.
+      النتيجة: shadow_price_error مع كل قيد، وكل نتائج المتابعة
+      فارغة (move_pct = null) فلا يدخل شيء في /blocked.
+      الإصلاح: split(":")[-1] يأخذ ما بعد أي بادئة منصة كانت.
+
+    ملاحظة: بعض عملات بيونكس غير مدرجة على بينانس سبوت (HYPE ·
+    VIRTUAL · CRO وغيرها). لهذا نجرّب السبوت أولاً ثم عقود USD-M،
+    وإن فشل الاثنان نسجّل الرمز المحوَّل ليظهر السبب في الدفتر
+    بدل خطأ صامت.
+    """
+    s = tk.split(":")[-1].replace(".P", "").replace("PERP", "").strip().upper()
+    urls = [
+        f"https://api.binance.com/api/v3/ticker/price?symbol={s}",   # سبوت
+        f"https://fapi.binance.com/fapi/v1/ticker/price?symbol={s}",  # عقود دائمة
+    ]
+    last_err = ""
+    for u in urls:
+        try:
+            with urllib.request.urlopen(u, timeout=10) as r:
+                return float(json.load(r)["price"])
+        except Exception as e:
+            last_err = str(e)[:60]
+    log("shadow_price_error", {"ticker": tk, "mapped": s, "err": last_err})
+    return None
 
 def shadow_queue(tk, d, src, ref_price, ref_ts, mkt,
                  executed=False, reason=None, gh=0, gr=0):

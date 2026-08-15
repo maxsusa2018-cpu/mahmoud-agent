@@ -564,7 +564,9 @@ def market_price(tk):
       errs = []
       for name, u, pick in tries:
                 try:
-                              with urllib.request.urlopen(u, timeout=10) as r:
+                              req = urllib.request.Request(u, headers={"User-Agent":
+                                                                                       "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36"})
+                              with urllib.request.urlopen(req, timeout=10) as r:
                                                 return float(pick(json.load(r))), name
                 except Exception as e:
                               errs.append(f"{name}:{type(e).__name__}:{str(e)[:40]}")

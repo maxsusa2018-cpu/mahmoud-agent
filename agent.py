@@ -533,36 +533,51 @@ BROKER = PaperBroker()
 #  سعر مستقل من بينانس، كما يفعل وكيل التسجيل.
 # ═══════════════════════════════════════════════════════════════
 
+def okx_symbol(tk):
+      """NEARUSDT.P → NEAR-USDT-SWAP · قاعدة عامة لكل عقود بيونكس الدائمة."""
+      u = tk.split(":")[-1].replace("PERP", "").replace(".P", "").strip().upper()
+      for q in ("USDT", "USDC", "USD"):
+                if u.endswith(q) and len(u) > len(q):
+                              return f"{u[:-len(q)]}-{q}-SWAP"
+                      return u
+
+
+def market_price(tk):
+      """
+          سعر مستقل — لا يعتمد على وصول تنبيه.
+
+              إصلاح ١٥ أغسطس: بينانس ترد 451 على عناوين Render (مقيسة بـcurl من داخل
+                  الخدمة)، وبايبت ترد 403. النتيجة كانت shadow_price_error مع كل قيد،
+                      وكل move_pct فارغ — أي أن دفتر الظل كله بلا قياس.
+                          البديل: OKX عقود دائمة (200 مؤكدة) ثم binance.vision سبوت احتياطاً.
+                              ترجع (السعر, اسم المصدر) ليُسجَّل المصدر الفعلي لا اسم ثابت.
+                                  """
+      okx = okx_symbol(tk)
+      spot = tk.split(":")[-1].replace("PERP", "").replace(".P", "").strip().upper()
+      tries = [
+                ("okx", f"https://www.okx.com/api/v5/market/ticker?instId={okx}",
+                          lambda j: j["data"][0]["last"]),
+                ("binance.vision",
+                          f"https://data-api.binance.vision/api/v3/ticker/price?symbol={spot}",
+                          lambda j: j["price"]),
+      ]
+      errs = []
+      for name, u, pick in tries:
+                try:
+                              with urllib.request.urlopen(u, timeout=10) as r:
+                                                return float(pick(json.load(r))), name
+                except Exception as e:
+                              errs.append(f"{name}:{type(e).__name__}:{str(e)[:40]}")
+                      log("shadow_price_error", {"ticker": tk, "mapped_okx": okx,
+                                                                                "mapped_spot": spot, "errs": errs})
+            return None, None
+
+
 def binance_price(tk):
-    """
-    سعر مستقل من بينانس — لا يعتمد على وصول تنبيه.
+      """اسم قديم محفوظ للتوافق — يرجع السعر وحده."""
+    p, _ = market_price(tk)
+    return p
 
-    إصلاح ١٤ أغسطس (0.8-f):
-      النسخة السابقة أزالت البادئة "BINANCE:" حرفياً فقط، فرمز مثل
-      PIONEX:ADAUSDT.P صار PIONEX:ADAUSDT وبينانس ترفضه.
-      النتيجة: shadow_price_error مع كل قيد، وكل نتائج المتابعة
-      فارغة (move_pct = null) فلا يدخل شيء في /blocked.
-      الإصلاح: split(":")[-1] يأخذ ما بعد أي بادئة منصة كانت.
-
-    ملاحظة: بعض عملات بيونكس غير مدرجة على بينانس سبوت (HYPE ·
-    VIRTUAL · CRO وغيرها). لهذا نجرّب السبوت أولاً ثم عقود USD-M،
-    وإن فشل الاثنان نسجّل الرمز المحوَّل ليظهر السبب في الدفتر
-    بدل خطأ صامت.
-    """
-    s = tk.split(":")[-1].replace(".P", "").replace("PERP", "").strip().upper()
-    urls = [
-        f"https://api.binance.com/api/v3/ticker/price?symbol={s}",   # سبوت
-        f"https://fapi.binance.com/fapi/v1/ticker/price?symbol={s}",  # عقود دائمة
-    ]
-    last_err = ""
-    for u in urls:
-        try:
-            with urllib.request.urlopen(u, timeout=10) as r:
-                return float(json.load(r)["price"])
-        except Exception as e:
-            last_err = str(e)[:60]
-    log("shadow_price_error", {"ticker": tk, "mapped": s, "err": last_err})
-    return None
 
 def shadow_queue(tk, d, src, ref_price, ref_ts, mkt,
                  executed=False, reason=None, gh=0, gr=0):
@@ -596,7 +611,7 @@ def shadow_worker():
                         continue
                     if due > now:
                         keep.append(r); continue
-                    p  = binance_price(r["tk"])
+                    p, via = market_price(r["tk"])
                     rp = r.get("ref_price")
                     mv = round((p - rp) / rp * 100 * r["dir"], 3) if (p and rp) else None
                     log("shadow_result", {
@@ -606,7 +621,7 @@ def shadow_worker():
                         "hit": (mv is not None and mv > 0),
                         "executed": r.get("executed"), "reason": r.get("reason"),
                         "gate_ha": r.get("gate_ha"), "gate_raw": r.get("gate_raw"),
-                        "via": "binance"})
+                        "via": via or "none"})
                 tmp = SHADOW_F + ".tmp"
                 with open(tmp, "w") as f:
                     for r in keep:

@@ -534,49 +534,49 @@ BROKER = PaperBroker()
 # ═══════════════════════════════════════════════════════════════
 
 def okx_symbol(tk):
-      """NEARUSDT.P → NEAR-USDT-SWAP · قاعدة عامة لكل عقود بيونكس الدائمة."""
-      u = tk.split(":")[-1].replace("PERP", "").replace(".P", "").strip().upper()
-      for q in ("USDT", "USDC", "USD"):
-                if u.endswith(q) and len(u) > len(q):
-                              return f"{u[:-len(q)]}-{q}-SWAP"
-                      return u
+    """NEARUSDT.P → NEAR-USDT-SWAP · قاعدة عامة لكل عقود بيونكس الدائمة."""
+    u = tk.split(":")[-1].replace("PERP", "").replace(".P", "").strip().upper()
+    for q in ("USDT", "USDC", "USD"):
+        if u.endswith(q) and len(u) > len(q):
+            return f"{u[:-len(q)]}-{q}-SWAP"
+    return u
 
 
 def market_price(tk):
-      """
-          سعر مستقل — لا يعتمد على وصول تنبيه.
+    """
+    سعر مستقل — لا يعتمد على وصول تنبيه.
 
-              إصلاح ١٥ أغسطس: بينانس ترد 451 على عناوين Render (مقيسة بـcurl من داخل
-                  الخدمة)، وبايبت ترد 403. النتيجة كانت shadow_price_error مع كل قيد،
-                      وكل move_pct فارغ — أي أن دفتر الظل كله بلا قياس.
-                          البديل: OKX عقود دائمة (200 مؤكدة) ثم binance.vision سبوت احتياطاً.
-                              ترجع (السعر, اسم المصدر) ليُسجَّل المصدر الفعلي لا اسم ثابت.
-                                  """
-      okx = okx_symbol(tk)
-      spot = tk.split(":")[-1].replace("PERP", "").replace(".P", "").strip().upper()
-      tries = [
-                ("okx", f"https://www.okx.com/api/v5/market/ticker?instId={okx}",
-                          lambda j: j["data"][0]["last"]),
-                ("binance.vision",
-                          f"https://data-api.binance.vision/api/v3/ticker/price?symbol={spot}",
-                          lambda j: j["price"]),
-      ]
-      errs = []
-      for name, u, pick in tries:
-                try:
-                              req = urllib.request.Request(u, headers={"User-Agent":
-                                                                                       "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36"})
-                              with urllib.request.urlopen(req, timeout=10) as r:
-                                                return float(pick(json.load(r))), name
-                except Exception as e:
-                              errs.append(f"{name}:{type(e).__name__}:{str(e)[:40]}")
-                      log("shadow_price_error", {"ticker": tk, "mapped_okx": okx,
-                                                                                "mapped_spot": spot, "errs": errs})
-            return None, None
+    إصلاح ١٥ أغسطس: بينانس ترد 451 على عناوين Render (مقيسة بـcurl من داخل
+    الخدمة)، وبايبت ترد 403. النتيجة كانت shadow_price_error مع كل قيد،
+    وكل move_pct فارغ — أي أن دفتر الظل كله بلا قياس.
+    البديل: OKX عقود دائمة (200 مؤكدة) ثم binance.vision سبوت احتياطاً.
+    ترجع (السعر, اسم المصدر) ليُسجَّل المصدر الفعلي لا اسم ثابت.
+    """
+    okx = okx_symbol(tk)
+    spot = tk.split(":")[-1].replace("PERP", "").replace(".P", "").strip().upper()
+    tries = [
+        ("okx", f"https://www.okx.com/api/v5/market/ticker?instId={okx}",
+         lambda j: j["data"][0]["last"]),
+        ("binance.vision",
+         f"https://data-api.binance.vision/api/v3/ticker/price?symbol={spot}",
+         lambda j: j["price"]),
+    ]
+    errs = []
+    for name, u, pick in tries:
+        try:
+            req = urllib.request.Request(u, headers={"User-Agent":
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36"})
+            with urllib.request.urlopen(req, timeout=10) as r:
+                return float(pick(json.load(r))), name
+        except Exception as e:
+            errs.append(f"{name}:{type(e).__name__}:{str(e)[:40]}")
+    log("shadow_price_error", {"ticker": tk, "mapped_okx": okx,
+                               "mapped_spot": spot, "errs": errs})
+    return None, None
 
 
 def binance_price(tk):
-      """اسم قديم محفوظ للتوافق — يرجع السعر وحده."""
+    """اسم قديم محفوظ للتوافق — يرجع السعر وحده."""
     p, _ = market_price(tk)
     return p
 
